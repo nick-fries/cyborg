@@ -15,6 +15,7 @@
 Utils for GPU driver.
 """
 
+import os
 import re
 
 from oslo_concurrency import processutils
@@ -36,7 +37,7 @@ GPU_INFO_PATTERN = re.compile(
     r"{4}):(?P<product_id>[0-9a-fA-F]{4})].*"
 )
 
-VENDOR_MAPS = {"10de": "nvidia", "102b": "matrox"}
+VENDOR_MAPS = {"10de": "nvidia", "102b": "matrox", "1002": "amd"}
 PRODUCT_ID_MAPS = {"1eb8": "T4", "15f7": "P100_PCIE_12GB"}
 
 
@@ -89,3 +90,19 @@ def discover_vendors():
             vendor_id = m.groupdict().get("vendor_id")
             vendors.add(vendor_id)
     return vendors
+
+
+def get_physfn(bdf):
+    """Return the parent PF BDF for a given VF BDF, or None.
+
+    Reads /sys/bus/pci/devices/<bdf>/physfn (a symlink) and resolves
+    the target's basename, which is the parent PF's BDF. Returns None
+    if the device is not a VF (no physfn symlink) or if the symlink
+    cannot be read.
+    """
+    physfn_path = '/sys/bus/pci/devices/%s/physfn' % bdf
+    try:
+        target = os.readlink(physfn_path)
+    except OSError:
+        return None
+    return os.path.basename(target)

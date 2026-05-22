@@ -91,6 +91,32 @@ An example is as the following::
 
 """,
     ),
+    cfg.ListOpt(
+        'enabled_amd_pf_product_ids',
+        default=["73a1"],
+        help="""
+PCI product IDs the AMD GPU driver treats as V620 Physical Functions.
+
+The AMD Radeon Pro V620 Physical Function reports PCI ID ``1002:73a1``.
+PFs are emitted as Cyborg deployables only when ``sriov_numvfs == 0``
+(i.e. the ``gim`` kernel module has not been loaded or no VFs have been
+created). Operators may extend this list to support additional V620 SKUs
+or future AMD MxGPU-capable boards that share the same discovery shape.
+""",
+    ),
+    cfg.ListOpt(
+        'enabled_amd_vf_product_ids',
+        default=["73ae"],
+        help="""
+PCI product IDs the AMD GPU driver treats as V620 Virtual Functions.
+
+The AMD Radeon Pro V620 SR-IOV VF reports PCI ID ``1002:73ae`` ("Navi 21
+[Radeon Pro V620 MxGPU]"). Unlike NVIDIA A100, AMD assigns PF and VF
+distinct device IDs, so VF identification is by product-ID match alone -
+no ``physfn`` sysfs walk is required. Operators may extend this list for
+additional V620-class VFs.
+""",
+    ),
 ]
 
 

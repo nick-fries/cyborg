@@ -1,0 +1,60 @@
+---
+features:
+  - |
+    Added the AMD Radeon Pro V620 GPU driver
+    (``amd_gpu_driver``) under
+    ``cyborg.accelerator.drivers.gpu.amd``. The driver discovers
+    V620 Physical Functions (PCI ID ``1002:73a1``) and SR-IOV
+    Virtual Functions (PCI ID ``1002:73ae``) created by AMD's
+    out-of-tree ``gim`` kernel module.
+  - |
+    PF and VF representation is mutually exclusive at the source: a
+    PF is reported as a deployable only when ``sriov_numvfs == 0``;
+    once VFs are created (``modprobe gim vf_num=N``) the PF is
+    suppressed and one deployable is emitted per VF. Each device
+    sits as its own sub-RP under the compute-host RP with inventory
+    ``PGPU=1``, so live re-sizing of the VF pool via the operator
+    knob (``echo N > sriov_numvfs``) is reflected on the next
+    discovery cycle.
+  - |
+    Each V620 deployable carries the ``OWNER_CYBORG`` and
+    ``CUSTOM_AMD_V620`` traits. PFs additionally carry
+    ``CUSTOM_AMD_V620_PF``; VFs additionally carry
+    ``CUSTOM_AMD_V620_VF`` and ``CUSTOM_AMD_MXGPU``. A per-device
+    NUMA trait is emitted from
+    ``/sys/bus/pci/devices/<BDF>/numa_node``:
+    ``CUSTOM_AMD_V620_NUMA<n>`` when the device has a valid NUMA
+    node, ``CUSTOM_AMD_V620_NUMA_NONE`` otherwise. Flavor authors
+    can require these traits to co-locate the GPU with pinned
+    vCPUs or a NUMA-aligned NIC VF on the same socket.
+  - |
+    Added the ``[gpu_devices] enabled_amd_pf_product_ids`` and
+    ``enabled_amd_vf_product_ids`` config options (defaulting to
+    ``["73a1"]`` and ``["73ae"]`` respectively) so operators can
+    extend the driver to V620 SKUs or future AMD MxGPU-capable
+    boards that share the same discovery shape.
+upgrade:
+  - |
+    Operators must enable the new driver in
+    ``[agent] enabled_drivers = ..., amd_gpu_driver`` on each
+    compute host with V620 hardware.
+  - |
+    Compute-host prerequisites:
+
+    * Mainboard SBIOS revision >= 1.2a (SR-IOV + ARI enabled, IOMMU
+      enabled).
+    * Kernel command line: ``intel_iommu=on`` (Intel) or
+      ``amd_iommu=on`` (AMD), plus ``iommu=pt``.
+    * AMD's out-of-tree ``gim`` kernel module
+      (https://github.com/amd/MxGPU-Virtualization) installed and
+      loaded with ``modprobe gim vf_num=N``. ``gim`` owns the PF;
+      the host should not also have ``amdgpu`` bound to the V620.
+    * VFs bound to ``vfio-pci`` via
+      ``echo "1002 73ae" > /sys/bus/pci/drivers/vfio-pci/new_id``.
+      The distinct VF device ID (``73ae``) lets a single ``new_id``
+      claim every V620 VF on the host without per-BDF
+      ``driver_override`` gymnastics.
+
+    Until these prerequisites are in place the driver will discover
+    only the PF (``sriov_numvfs == 0``) and report it as a single
+    accelerator.

@@ -24,7 +24,7 @@ from cyborg.accelerator.drivers.gpu import utils
 
 LOG = logging.getLogger(__name__)
 
-VENDOR_MAPS = {"10de": "nvidia", "102b": "matrox"}
+VENDOR_MAPS = {"10de": "nvidia", "102b": "matrox", "1002": "amd"}
 
 
 class GPUDriver:
