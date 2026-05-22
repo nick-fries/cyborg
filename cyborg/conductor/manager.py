@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import time
 import uuid
 
 import oslo_messaging as messaging
@@ -47,6 +48,12 @@ class ConductorManager:
         self.topic = topic
         self.host = host or CONF.host
         self.placement_client = placement_client.PlacementClient()
+        # Phase 3 (PLAN-amd-v620.md §8.5): timestamp of last
+        # ``_periodic_rp_subtree_sweep`` execution. Used to gate
+        # the expensive sweep behind
+        # ``[conductor] periodic_rp_sweep_interval``. The cheaper
+        # duplicate-cpid scan runs on every cycle.
+        self._last_rp_sweep_ts = 0.0
 
     def init_host(self):
         """Hook called on service startup. Heals NULL project_id ARQs."""
@@ -144,8 +151,26 @@ class ConductorManager:
     ):
         """Compare new driver-side device object list with the old one in
         one host.
+
+        Phase 3 (PLAN-amd-v620.md §8.5): also performs:
+          1. Duplicate-cpid detection -- if any cpid_info maps to more
+             than one Device row in the DB (BDF reassignment / PCI
+             rescan), the oldest duplicate is removed.
+          2. Periodic RP-subtree sweep (gated by
+             ``[conductor] periodic_rp_sweep_interval``) -- removes
+             Placement RPs whose Cyborg DB row has already been
+             deleted (a previous reconcile's partial failure).
         """
         LOG.info("Start differing devices.")
+        # Phase 3: collapse duplicate-cpid rows BEFORE the diff so the
+        # diff doesn't see the stale row in old_driver_device_list-less
+        # form. Safe to call even when no duplicates exist (cheap walk).
+        try:
+            self._collapse_duplicate_cpid_rows(context, host)
+        except Exception:
+            LOG.exception(
+                "Duplicate-cpid collapse raised; continuing diff."
+            )
         # TODO(): The placement report will be implemented here.
         # Use cpid.cpid_info to identify whether the device is the same.
         stub_cpid_list = [
@@ -245,6 +270,16 @@ class ConductorManager:
                 new_driver_dev_obj.deployable_list,
                 host_rp,
                 host_name=host,
+            )
+
+        # Phase 3: periodic subtree sweep (gated by interval config).
+        # Runs after the regular diff so it picks up RPs whose Cyborg
+        # row was just deleted by ``deleted`` handling above.
+        try:
+            self._maybe_run_periodic_rp_sweep(context, host)
+        except Exception:
+            LOG.exception(
+                "Periodic RP-subtree sweep raised; continuing."
             )
 
     def drv_deployable_make_diff(
@@ -954,6 +989,244 @@ class ConductorManager:
         self._maybe_gc_anchor_subprovider(
             context, candidate_uuid, name_marker="_numa_",
         )
+
+    # ---- Phase 3 (PLAN-amd-v620.md §8.5): periodic RP reconcile ----
+    # Two coordinated mechanisms guard against stale Placement state:
+    #
+    # 1. ``_collapse_duplicate_cpid_rows`` -- runs every cycle. After a
+    #    PCI rescan or slot change the same physical card can appear
+    #    under a new BDF while the old ``ControlpathID.cpid_info`` row
+    #    lingers as a different Device row. We detect cpid_info ->
+    #    multiple Devices and remove the oldest one (by ``created_at``).
+    #    Cheap: one DB query per cycle.
+    #
+    # 2. ``_maybe_run_periodic_rp_sweep`` -- gated behind
+    #    ``[conductor] periodic_rp_sweep_interval`` (default 3600 s).
+    #    Lists every RP in the host's subtree and removes any whose
+    #    Cyborg-side Device row is absent. Deferred-delete protected:
+    #    RPs with live allocations are skipped.
+    #
+    # Both are wired into ``drv_device_make_diff``: the diff itself
+    # already deletes obsolete RPs when the agent reports a shorter
+    # list; this code closes the residual gaps when (a) the agent
+    # never reaches the conductor, or (b) the previous cycle's
+    # delete partially failed.
+
+    def _collapse_duplicate_cpid_rows(self, context, host):
+        """Remove duplicate Device rows that share a cpid_info value.
+
+        Detects the BDF-reassignment / PCI-rescan zombie case where
+        the same physical controlpath value appears in more than one
+        Device row. Keeps the *newest* row and removes the others.
+
+        Returns the number of duplicate rows removed (0 in the
+        steady state). Failure on any one row is logged and does not
+        stop processing of the remaining rows.
+        """
+        try:
+            device_obj_list = Device.get_list_by_hostname(context, host)
+        except Exception as exc:
+            LOG.warning(
+                "Duplicate-cpid scan: cannot list devices for host "
+                "%(host)s: %(err)s",
+                {'host': host, 'err': exc},
+            )
+            return 0
+        # Build cpid_info -> [device_obj] map.
+        groups = {}
+        for dev_obj in device_obj_list:
+            # Find this device's cpid_info. A device row can have
+            # multiple controlpath_ids in theory; we group by each
+            # cpid_info so any collision is caught.
+            try:
+                cpids = ControlpathID.list(
+                    context, filters={'device_id': dev_obj.id},
+                )
+            except Exception as exc:
+                LOG.debug(
+                    "Skip dev %(id)s in cpid scan: %(err)s",
+                    {'id': dev_obj.id, 'err': exc},
+                )
+                continue
+            for cpid in cpids:
+                groups.setdefault(cpid.cpid_info, []).append(dev_obj)
+
+        removed = 0
+        for cpid_info, rows in groups.items():
+            if len(rows) <= 1:
+                continue
+            # Sort by created_at so the OLDEST is the first item; that
+            # is the one we remove (the newer row is the live device).
+            try:
+                rows_sorted = sorted(
+                    rows,
+                    key=lambda d: getattr(d, 'created_at', None) or 0,
+                )
+            except TypeError:
+                rows_sorted = rows
+            oldest = rows_sorted[0]
+            LOG.warning(
+                "Duplicate-cpid detected on host %(host)s: cpid_info "
+                "%(cpid)r maps to %(n)d Device rows; removing oldest "
+                "id=%(id)s.",
+                {
+                    'host': host, 'cpid': cpid_info,
+                    'n': len(rows), 'id': oldest.id,
+                },
+            )
+            # Delete deployable RPs for the oldest, then the Device
+            # row itself. Deferred-delete protection lives in
+            # ``_delete_provider_and_sub_providers``.
+            try:
+                deployables = Deployable.get_list_by_device_id(
+                    context, oldest.id,
+                )
+            except Exception as exc:
+                LOG.debug(
+                    "Could not list deployables for dev %(id)s: "
+                    "%(err)s",
+                    {'id': oldest.id, 'err': exc},
+                )
+                deployables = []
+            for dep in deployables:
+                rp_uuid = getattr(dep, 'rp_uuid', None)
+                if rp_uuid:
+                    try:
+                        self._delete_provider_and_sub_providers(
+                            context, rp_uuid,
+                        )
+                    except Exception as exc:
+                        LOG.warning(
+                            "Failed to delete RP %(uuid)s during "
+                            "duplicate-cpid collapse: %(err)s",
+                            {'uuid': rp_uuid, 'err': exc},
+                        )
+            try:
+                oldest.destroy(context)
+                removed += 1
+            except Exception as exc:
+                LOG.warning(
+                    "Failed to destroy duplicate Device id=%(id)s: "
+                    "%(err)s",
+                    {'id': oldest.id, 'err': exc},
+                )
+        return removed
+
+    def _maybe_run_periodic_rp_sweep(self, context, host):
+        """Run the host-subtree sweep at most once per configured interval.
+
+        The cheap duplicate-cpid scan runs every cycle; this method
+        guards the more expensive sweep behind a config interval. The
+        sweep itself is implemented by ``_periodic_rp_subtree_sweep``.
+
+        :returns: True if the sweep ran this cycle, False if skipped.
+        """
+        interval = getattr(
+            CONF.conductor, 'periodic_rp_sweep_interval', 3600,
+        )
+        now = time.time()
+        if interval > 0 and (now - self._last_rp_sweep_ts) < interval:
+            return False
+        self._last_rp_sweep_ts = now
+        try:
+            self._periodic_rp_subtree_sweep(context, host)
+        except Exception:
+            LOG.exception(
+                "Periodic RP-subtree sweep failed; will retry on the "
+                "next eligible cycle."
+            )
+        return True
+
+    def _periodic_rp_subtree_sweep(self, context, host):
+        """Delete RPs in the host subtree that have no live Cyborg row.
+
+        Walks ``get_providers_in_tree(host_root)`` and, for each RP
+        that is NOT (a) the host root, (b) a socket/NUMA anchor, or
+        (c) referenced by some Deployable.rp_uuid on this host, calls
+        ``_delete_provider_and_sub_providers``. Anchor RPs are
+        garbage-collected separately by the existing
+        ``_maybe_gc_*_subprovider`` chain; we skip them here to avoid
+        double-deleting.
+
+        Returns the number of RPs successfully deleted (deferred
+        ones are skipped silently).
+        """
+        try:
+            host_root = self._get_root_provider(context, host)
+        except Exception as exc:
+            LOG.debug(
+                "RP-subtree sweep: cannot resolve host root for "
+                "%(host)s: %(err)s",
+                {'host': host, 'err': exc},
+            )
+            return 0
+        try:
+            in_tree = self.placement_client.get_providers_in_tree(
+                context, host_root,
+            )
+        except Exception as exc:
+            LOG.debug(
+                "RP-subtree sweep: get_providers_in_tree failed: %s",
+                exc,
+            )
+            return 0
+        try:
+            device_obj_list = Device.get_list_by_hostname(context, host)
+        except Exception as exc:
+            LOG.debug(
+                "RP-subtree sweep: cannot list devices: %s", exc,
+            )
+            return 0
+        # Build set of rp_uuids that are STILL referenced by a live
+        # Cyborg Deployable.
+        live_rp_uuids = set()
+        for dev_obj in device_obj_list:
+            try:
+                deployables = Deployable.get_list_by_device_id(
+                    context, dev_obj.id,
+                )
+            except Exception:
+                continue
+            for dep in deployables:
+                rp = getattr(dep, 'rp_uuid', None)
+                if rp:
+                    live_rp_uuids.add(rp)
+
+        deleted = 0
+        for rp in in_tree:
+            rp_uuid = rp.get('uuid')
+            if not rp_uuid or rp_uuid == host_root:
+                continue
+            name = rp.get('name') or ''
+            # Skip socket/NUMA anchors -- the anchor gc chain owns
+            # those; we'd otherwise double-delete and possibly race.
+            if '_socket_' in name or '_numa_' in name:
+                continue
+            if rp_uuid in live_rp_uuids:
+                continue
+            LOG.info(
+                "RP-subtree sweep: deleting orphan RP %(uuid)s "
+                "(%(name)s); no Cyborg DB row references it.",
+                {'uuid': rp_uuid, 'name': name},
+            )
+            try:
+                self._delete_provider_and_sub_providers(
+                    context, rp_uuid,
+                )
+                # Best-effort accounting: count one per call. The
+                # callee handles deferred-delete on its own.
+                if rp_uuid not in self._deferred_delete_rp_uuids:
+                    deleted += 1
+            except Exception as exc:
+                LOG.warning(
+                    "RP-subtree sweep failed on %(uuid)s: %(err)s",
+                    {'uuid': rp_uuid, 'err': exc},
+                )
+        LOG.info(
+            "RP-subtree sweep: deleted %d orphan RP(s) on host "
+            "%s.", deleted, host,
+        )
+        return deleted
 
 
 def _gen_resource_inventory(resource_class, total):

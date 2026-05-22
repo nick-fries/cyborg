@@ -808,3 +808,607 @@ class SocketAnchorSubRPTest(base.TestCase):
         self.assertIn('NUMA-RP-A', delete_calls)
         # Socket NOT deleted because NUMA-RP-B is still a child.
         self.assertNotIn('SOCKET-RP', delete_calls)
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 (PLAN-amd-v620.md §8.5): periodic RP reconcile
+# ---------------------------------------------------------------------------
+
+class _StubDevice:
+    """Lightweight stand-in for ``cyborg.objects.device.Device`` rows."""
+
+    def __init__(self, dev_id, created_at):
+        self.id = dev_id
+        self.uuid = "uuid-%s" % dev_id
+        self.created_at = created_at
+        self.destroyed = False
+
+    def destroy(self, context):
+        self.destroyed = True
+
+
+class _StubCpid:
+    def __init__(self, cpid_info):
+        self.cpid_info = cpid_info
+
+
+class _StubDep:
+    def __init__(self, rp_uuid):
+        self.rp_uuid = rp_uuid
+
+
+class TestCollapseDuplicateCpidRows(base.TestCase):
+    """Fix 3.1 -- duplicate-cpid detection."""
+
+    def setUp(self):
+        super().setUp()
+        self.placement_mock = self.useFixture(
+            fixtures.MockPatch(
+                'cyborg.common.placement_client.PlacementClient'
+            )
+        ).mock.return_value
+        self.cm = manager.ConductorManager(
+            mock.sentinel.topic, 'host042'
+        )
+
+    def _patch_objects(self, devices, cpids_by_dev, deps_by_dev=None):
+        deps_by_dev = deps_by_dev or {}
+        self.useFixture(fixtures.MockPatch(
+            'cyborg.objects.device.Device.get_list_by_hostname',
+            return_value=devices,
+        ))
+
+        def _list(context, filters):
+            return cpids_by_dev.get(filters['device_id'], [])
+        self.useFixture(fixtures.MockPatch(
+            'cyborg.objects.control_path.ControlpathID.list',
+            side_effect=_list,
+        ))
+
+        def _deps(context, device_id):
+            return deps_by_dev.get(device_id, [])
+        self.useFixture(fixtures.MockPatch(
+            'cyborg.objects.deployable.Deployable.get_list_by_device_id',
+            side_effect=_deps,
+        ))
+
+    def test_no_duplicates_returns_zero(self):
+        # Arrange
+        d1 = _StubDevice(1, created_at=100)
+        d2 = _StubDevice(2, created_at=200)
+        self._patch_objects(
+            devices=[d1, d2],
+            cpids_by_dev={
+                1: [_StubCpid('cpid-A')],
+                2: [_StubCpid('cpid-B')],
+            },
+        )
+        # Act
+        n = self.cm._collapse_duplicate_cpid_rows(
+            mock.sentinel.context, 'host042',
+        )
+        # Assert
+        self.assertEqual(0, n)
+        self.assertFalse(d1.destroyed)
+        self.assertFalse(d2.destroyed)
+
+    def test_one_duplicate_pair_removes_oldest(self):
+        d_old = _StubDevice(1, created_at=100)
+        d_new = _StubDevice(2, created_at=200)
+        self._patch_objects(
+            devices=[d_old, d_new],
+            cpids_by_dev={
+                1: [_StubCpid('cpid-dup')],
+                2: [_StubCpid('cpid-dup')],
+            },
+        )
+        n = self.cm._collapse_duplicate_cpid_rows(
+            mock.sentinel.context, 'host042',
+        )
+        self.assertEqual(1, n)
+        self.assertTrue(d_old.destroyed)
+        self.assertFalse(d_new.destroyed)
+
+    def test_duplicate_with_rp_uuid_deletes_provider(self):
+        """Removing the oldest row also tears down its deployable RPs."""
+        d_old = _StubDevice(1, created_at=100)
+        d_new = _StubDevice(2, created_at=200)
+        self._patch_objects(
+            devices=[d_old, d_new],
+            cpids_by_dev={
+                1: [_StubCpid('cpid-dup')],
+                2: [_StubCpid('cpid-dup')],
+            },
+            deps_by_dev={1: [_StubDep('rp-old')]},
+        )
+        with mock.patch.object(
+            self.cm, '_delete_provider_and_sub_providers',
+        ) as mock_del:
+            self.cm._collapse_duplicate_cpid_rows(
+                mock.sentinel.context, 'host042',
+            )
+            mock_del.assert_called_once_with(
+                mock.sentinel.context, 'rp-old',
+            )
+
+    def test_three_way_duplicate_removes_only_oldest(self):
+        d_oldest = _StubDevice(1, created_at=100)
+        d_middle = _StubDevice(2, created_at=200)
+        d_newest = _StubDevice(3, created_at=300)
+        self._patch_objects(
+            devices=[d_oldest, d_middle, d_newest],
+            cpids_by_dev={
+                1: [_StubCpid('cpid-dup')],
+                2: [_StubCpid('cpid-dup')],
+                3: [_StubCpid('cpid-dup')],
+            },
+        )
+        n = self.cm._collapse_duplicate_cpid_rows(
+            mock.sentinel.context, 'host042',
+        )
+        # Removes the SINGLE oldest, leaves the rest -- if another
+        # duplicate persists, next cycle catches it.
+        self.assertEqual(1, n)
+        self.assertTrue(d_oldest.destroyed)
+        self.assertFalse(d_middle.destroyed)
+        self.assertFalse(d_newest.destroyed)
+
+    def test_device_list_failure_returns_zero(self):
+        self.useFixture(fixtures.MockPatch(
+            'cyborg.objects.device.Device.get_list_by_hostname',
+            side_effect=RuntimeError('boom'),
+        ))
+        n = self.cm._collapse_duplicate_cpid_rows(
+            mock.sentinel.context, 'host042',
+        )
+        self.assertEqual(0, n)
+
+    def test_destroy_failure_logs_and_continues(self):
+        """One row failing to destroy must not abort the loop."""
+        d_old_a = _StubDevice(1, created_at=100)
+        d_new_a = _StubDevice(2, created_at=200)
+        d_old_b = _StubDevice(3, created_at=110)
+        d_new_b = _StubDevice(4, created_at=210)
+
+        def _broken_destroy(context):
+            raise RuntimeError('boom')
+        d_old_a.destroy = _broken_destroy
+
+        self._patch_objects(
+            devices=[d_old_a, d_new_a, d_old_b, d_new_b],
+            cpids_by_dev={
+                1: [_StubCpid('cpid-A')],
+                2: [_StubCpid('cpid-A')],
+                3: [_StubCpid('cpid-B')],
+                4: [_StubCpid('cpid-B')],
+            },
+        )
+        # Must not raise. The B pair still gets collapsed.
+        n = self.cm._collapse_duplicate_cpid_rows(
+            mock.sentinel.context, 'host042',
+        )
+        self.assertEqual(1, n)  # Only B was destroyed; A failed.
+        self.assertTrue(d_old_b.destroyed)
+
+
+class TestMaybeRunPeriodicRpSweep(base.TestCase):
+    """Fix 3.2 -- gating of the periodic subtree sweep."""
+
+    def setUp(self):
+        super().setUp()
+        self.placement_mock = self.useFixture(
+            fixtures.MockPatch(
+                'cyborg.common.placement_client.PlacementClient'
+            )
+        ).mock.return_value
+        self.cm = manager.ConductorManager(
+            mock.sentinel.topic, 'host042'
+        )
+
+    def test_sweep_runs_when_last_run_is_long_ago(self):
+        # Last sweep at t=0, interval=3600, now=10000 -> run.
+        from cyborg.conf import CONF
+        CONF.set_override(
+            'periodic_rp_sweep_interval', 3600, group='conductor',
+        )
+        self.addCleanup(
+            CONF.clear_override,
+            'periodic_rp_sweep_interval', group='conductor',
+        )
+        self.cm._last_rp_sweep_ts = 0.0
+        with mock.patch('cyborg.conductor.manager.time') as mock_time:
+            mock_time.time.return_value = 10000.0
+            with mock.patch.object(
+                self.cm, '_periodic_rp_subtree_sweep',
+            ) as mock_sweep:
+                ran = self.cm._maybe_run_periodic_rp_sweep(
+                    mock.sentinel.context, 'host042',
+                )
+                self.assertTrue(ran)
+                mock_sweep.assert_called_once()
+
+    def test_sweep_skipped_inside_interval(self):
+        from cyborg.conf import CONF
+        CONF.set_override(
+            'periodic_rp_sweep_interval', 3600, group='conductor',
+        )
+        self.addCleanup(
+            CONF.clear_override,
+            'periodic_rp_sweep_interval', group='conductor',
+        )
+        self.cm._last_rp_sweep_ts = 9000.0
+        with mock.patch('cyborg.conductor.manager.time') as mock_time:
+            mock_time.time.return_value = 9500.0  # only 500s elapsed
+            with mock.patch.object(
+                self.cm, '_periodic_rp_subtree_sweep',
+            ) as mock_sweep:
+                ran = self.cm._maybe_run_periodic_rp_sweep(
+                    mock.sentinel.context, 'host042',
+                )
+                self.assertFalse(ran)
+                mock_sweep.assert_not_called()
+
+    def test_sweep_always_runs_when_interval_zero(self):
+        from cyborg.conf import CONF
+        CONF.set_override(
+            'periodic_rp_sweep_interval', 0, group='conductor',
+        )
+        self.addCleanup(
+            CONF.clear_override,
+            'periodic_rp_sweep_interval', group='conductor',
+        )
+        self.cm._last_rp_sweep_ts = 100.0
+        with mock.patch('cyborg.conductor.manager.time') as mock_time:
+            mock_time.time.return_value = 100.5  # almost no elapsed
+            with mock.patch.object(
+                self.cm, '_periodic_rp_subtree_sweep',
+            ) as mock_sweep:
+                ran = self.cm._maybe_run_periodic_rp_sweep(
+                    mock.sentinel.context, 'host042',
+                )
+                self.assertTrue(ran)
+                mock_sweep.assert_called_once()
+
+    def test_sweep_exception_swallowed(self):
+        """The sweep MUST never raise into the caller."""
+        from cyborg.conf import CONF
+        CONF.set_override(
+            'periodic_rp_sweep_interval', 0, group='conductor',
+        )
+        self.addCleanup(
+            CONF.clear_override,
+            'periodic_rp_sweep_interval', group='conductor',
+        )
+        with mock.patch.object(
+            self.cm, '_periodic_rp_subtree_sweep',
+            side_effect=RuntimeError('boom'),
+        ):
+            # Must not raise.
+            ran = self.cm._maybe_run_periodic_rp_sweep(
+                mock.sentinel.context, 'host042',
+            )
+            self.assertTrue(ran)
+
+    def test_timestamp_updated_only_when_ran(self):
+        """The ``_last_rp_sweep_ts`` must NOT advance on a skipped run."""
+        from cyborg.conf import CONF
+        CONF.set_override(
+            'periodic_rp_sweep_interval', 3600, group='conductor',
+        )
+        self.addCleanup(
+            CONF.clear_override,
+            'periodic_rp_sweep_interval', group='conductor',
+        )
+        self.cm._last_rp_sweep_ts = 9000.0
+        with mock.patch('cyborg.conductor.manager.time') as mock_time:
+            mock_time.time.return_value = 9500.0
+            with mock.patch.object(
+                self.cm, '_periodic_rp_subtree_sweep',
+            ):
+                self.cm._maybe_run_periodic_rp_sweep(
+                    mock.sentinel.context, 'host042',
+                )
+                # Unchanged because we did not run.
+                self.assertEqual(9000.0, self.cm._last_rp_sweep_ts)
+
+
+class TestPeriodicRpSubtreeSweep(base.TestCase):
+    """Fix 3.2 -- the subtree sweep itself."""
+
+    def setUp(self):
+        super().setUp()
+        self.placement_mock = self.useFixture(
+            fixtures.MockPatch(
+                'cyborg.common.placement_client.PlacementClient'
+            )
+        ).mock.return_value
+        self.cm = manager.ConductorManager(
+            mock.sentinel.topic, 'host042'
+        )
+        # Always resolve the host root to a known UUID.
+        self.useFixture(fixtures.MockPatch(
+            'cyborg.conductor.manager.ConductorManager._get_root_provider',
+            return_value='host-root',
+        ))
+
+    def _set_tree(self, tree):
+        self.placement_mock.get_providers_in_tree.return_value = tree
+
+    def _set_devices(self, devices, deps_by_dev=None):
+        deps_by_dev = deps_by_dev or {}
+        self.useFixture(fixtures.MockPatch(
+            'cyborg.objects.device.Device.get_list_by_hostname',
+            return_value=devices,
+        ))
+
+        def _deps(context, device_id):
+            return deps_by_dev.get(device_id, [])
+        self.useFixture(fixtures.MockPatch(
+            'cyborg.objects.deployable.Deployable.get_list_by_device_id',
+            side_effect=_deps,
+        ))
+
+    def test_empty_tree_returns_zero(self):
+        self._set_tree([])
+        self._set_devices([])
+        n = self.cm._periodic_rp_subtree_sweep(
+            mock.sentinel.context, 'host042',
+        )
+        self.assertEqual(0, n)
+
+    def test_host_root_is_never_deleted(self):
+        self._set_tree([
+            {'uuid': 'host-root', 'name': 'host042',
+             'parent_provider_uuid': None},
+        ])
+        self._set_devices([])
+        with mock.patch.object(
+            self.cm, '_delete_provider_and_sub_providers',
+        ) as mock_del:
+            self.cm._periodic_rp_subtree_sweep(
+                mock.sentinel.context, 'host042',
+            )
+            mock_del.assert_not_called()
+
+    def test_socket_anchor_is_skipped(self):
+        """Anchor RPs are gc'd by the anchor chain; the sweep
+        leaves them alone."""
+        self._set_tree([
+            {'uuid': 'host-root', 'name': 'host042',
+             'parent_provider_uuid': None},
+            {'uuid': 'socket-rp', 'name': 'host042_socket_0',
+             'parent_provider_uuid': 'host-root'},
+        ])
+        self._set_devices([])
+        with mock.patch.object(
+            self.cm, '_delete_provider_and_sub_providers',
+        ) as mock_del:
+            self.cm._periodic_rp_subtree_sweep(
+                mock.sentinel.context, 'host042',
+            )
+            mock_del.assert_not_called()
+
+    def test_numa_anchor_is_skipped(self):
+        self._set_tree([
+            {'uuid': 'host-root', 'name': 'host042',
+             'parent_provider_uuid': None},
+            {'uuid': 'numa-rp', 'name': 'host042_numa_1',
+             'parent_provider_uuid': 'host-root'},
+        ])
+        self._set_devices([])
+        with mock.patch.object(
+            self.cm, '_delete_provider_and_sub_providers',
+        ) as mock_del:
+            self.cm._periodic_rp_subtree_sweep(
+                mock.sentinel.context, 'host042',
+            )
+            mock_del.assert_not_called()
+
+    def test_live_rp_is_not_deleted(self):
+        """An RP referenced by a live Cyborg deployable must remain."""
+        self._set_tree([
+            {'uuid': 'host-root', 'name': 'host042',
+             'parent_provider_uuid': None},
+            {'uuid': 'rp-live', 'name': 'host042_dep_live',
+             'parent_provider_uuid': 'host-root'},
+        ])
+        d = _StubDevice(1, created_at=100)
+        self._set_devices(
+            [d],
+            deps_by_dev={1: [_StubDep('rp-live')]},
+        )
+        with mock.patch.object(
+            self.cm, '_delete_provider_and_sub_providers',
+        ) as mock_del:
+            self.cm._periodic_rp_subtree_sweep(
+                mock.sentinel.context, 'host042',
+            )
+            mock_del.assert_not_called()
+
+    def test_orphan_rp_is_deleted(self):
+        """An RP NOT referenced by any Cyborg deployable is orphan."""
+        self._set_tree([
+            {'uuid': 'host-root', 'name': 'host042',
+             'parent_provider_uuid': None},
+            {'uuid': 'rp-orphan', 'name': 'host042_dep_orphan',
+             'parent_provider_uuid': 'host-root'},
+        ])
+        self._set_devices([])
+        with mock.patch.object(
+            self.cm, '_delete_provider_and_sub_providers',
+        ) as mock_del:
+            self.cm._periodic_rp_subtree_sweep(
+                mock.sentinel.context, 'host042',
+            )
+            mock_del.assert_called_once_with(
+                mock.sentinel.context, 'rp-orphan',
+            )
+
+    def test_mixed_live_and_orphan_only_orphan_deleted(self):
+        self._set_tree([
+            {'uuid': 'host-root', 'name': 'host042',
+             'parent_provider_uuid': None},
+            {'uuid': 'rp-live', 'name': 'host042_dep_live',
+             'parent_provider_uuid': 'host-root'},
+            {'uuid': 'rp-orphan', 'name': 'host042_dep_orphan',
+             'parent_provider_uuid': 'host-root'},
+        ])
+        d = _StubDevice(1, created_at=100)
+        self._set_devices(
+            [d],
+            deps_by_dev={1: [_StubDep('rp-live')]},
+        )
+        with mock.patch.object(
+            self.cm, '_delete_provider_and_sub_providers',
+        ) as mock_del:
+            self.cm._periodic_rp_subtree_sweep(
+                mock.sentinel.context, 'host042',
+            )
+            mock_del.assert_called_once_with(
+                mock.sentinel.context, 'rp-orphan',
+            )
+
+    def test_host_root_lookup_failure_returns_zero(self):
+        # Override the setUp patch to raise.
+        from cyborg.common import exception
+        with mock.patch.object(
+            manager.ConductorManager, '_get_root_provider',
+            side_effect=exception.PlacementResourceProviderNotFound(
+                resource_provider='host042',
+            ),
+        ):
+            n = self.cm._periodic_rp_subtree_sweep(
+                mock.sentinel.context, 'host042',
+            )
+        self.assertEqual(0, n)
+
+    def test_in_tree_failure_returns_zero(self):
+        self.placement_mock.get_providers_in_tree.side_effect = (
+            RuntimeError('boom')
+        )
+        self._set_devices([])
+        n = self.cm._periodic_rp_subtree_sweep(
+            mock.sentinel.context, 'host042',
+        )
+        self.assertEqual(0, n)
+
+    def test_delete_failure_continues_with_other_rps(self):
+        self._set_tree([
+            {'uuid': 'host-root', 'name': 'host042',
+             'parent_provider_uuid': None},
+            {'uuid': 'rp-broken', 'name': 'host042_dep_broken',
+             'parent_provider_uuid': 'host-root'},
+            {'uuid': 'rp-ok', 'name': 'host042_dep_ok',
+             'parent_provider_uuid': 'host-root'},
+        ])
+        self._set_devices([])
+        # First call raises, second succeeds.
+        with mock.patch.object(
+            self.cm, '_delete_provider_and_sub_providers',
+            side_effect=[RuntimeError('boom'), None],
+        ) as mock_del:
+            n = self.cm._periodic_rp_subtree_sweep(
+                mock.sentinel.context, 'host042',
+            )
+            self.assertEqual(2, mock_del.call_count)
+            # Only one succeeded.
+            self.assertEqual(1, n)
+
+    def test_deferred_delete_not_counted(self):
+        """When an RP is deferred (has allocations), it MUST NOT be
+        counted in the 'deleted' tally."""
+        self._set_tree([
+            {'uuid': 'host-root', 'name': 'host042',
+             'parent_provider_uuid': None},
+            {'uuid': 'rp-allocated', 'name': 'host042_dep_alloc',
+             'parent_provider_uuid': 'host-root'},
+        ])
+        self._set_devices([])
+
+        def _fake_del(context, rp_uuid):
+            # Simulate _delete_provider_and_sub_providers deferring.
+            self.cm._deferred_delete_rp_uuids.add(rp_uuid)
+
+        with mock.patch.object(
+            self.cm, '_delete_provider_and_sub_providers',
+            side_effect=_fake_del,
+        ):
+            self.cm._deferred_delete_rp_uuids.clear()
+            n = self.cm._periodic_rp_subtree_sweep(
+                mock.sentinel.context, 'host042',
+            )
+        self.assertEqual(0, n)
+
+
+class TestDrvDeviceDiffWiresInReconcile(base.TestCase):
+    """Smoke-test that ``drv_device_make_diff`` invokes the new
+    duplicate-cpid scan and the gated periodic sweep."""
+
+    def setUp(self):
+        super().setUp()
+        self.placement_mock = self.useFixture(
+            fixtures.MockPatch(
+                'cyborg.common.placement_client.PlacementClient'
+            )
+        ).mock.return_value
+        self.cm = manager.ConductorManager(
+            mock.sentinel.topic, 'host042'
+        )
+
+    def test_diff_invokes_duplicate_cpid_scan(self):
+        with mock.patch.object(
+            self.cm, '_get_root_provider', return_value='host-root',
+        ), mock.patch.object(
+            self.cm, '_collapse_duplicate_cpid_rows',
+        ) as mock_collapse, mock.patch.object(
+            self.cm, '_maybe_run_periodic_rp_sweep',
+        ):
+            self.cm.drv_device_make_diff(
+                mock.sentinel.context, 'host042', [], [],
+            )
+            mock_collapse.assert_called_once_with(
+                mock.sentinel.context, 'host042',
+            )
+
+    def test_diff_invokes_periodic_sweep_gate(self):
+        with mock.patch.object(
+            self.cm, '_get_root_provider', return_value='host-root',
+        ), mock.patch.object(
+            self.cm, '_collapse_duplicate_cpid_rows',
+        ), mock.patch.object(
+            self.cm, '_maybe_run_periodic_rp_sweep',
+        ) as mock_gate:
+            self.cm.drv_device_make_diff(
+                mock.sentinel.context, 'host042', [], [],
+            )
+            mock_gate.assert_called_once_with(
+                mock.sentinel.context, 'host042',
+            )
+
+    def test_diff_swallows_duplicate_scan_exception(self):
+        with mock.patch.object(
+            self.cm, '_get_root_provider', return_value='host-root',
+        ), mock.patch.object(
+            self.cm, '_collapse_duplicate_cpid_rows',
+            side_effect=RuntimeError('boom'),
+        ), mock.patch.object(
+            self.cm, '_maybe_run_periodic_rp_sweep',
+        ):
+            # Must not raise.
+            self.cm.drv_device_make_diff(
+                mock.sentinel.context, 'host042', [], [],
+            )
+
+    def test_diff_swallows_periodic_sweep_exception(self):
+        with mock.patch.object(
+            self.cm, '_get_root_provider', return_value='host-root',
+        ), mock.patch.object(
+            self.cm, '_collapse_duplicate_cpid_rows',
+        ), mock.patch.object(
+            self.cm, '_maybe_run_periodic_rp_sweep',
+            side_effect=RuntimeError('boom'),
+        ):
+            # Must not raise.
+            self.cm.drv_device_make_diff(
+                mock.sentinel.context, 'host042', [], [],
+            )
