@@ -26,6 +26,15 @@ from cyborg.common import utils
 LOG = logging.getLogger(__name__)
 NESTED_PROVIDER_API_VERSION = '1.14'
 POST_RPS_RETURNS_PAYLOAD_API_VERSION = '1.20'
+# Phase 2 (PLAN-amd-v620.md §8.4): Cyborg itself does not issue
+# ``same_subtree=`` queries, but the Nova-side fork relies on Placement
+# accepting at least microversion 1.36 from co-resident clients on the
+# same deployment, and the simple GET/PUT/DELETE endpoints Cyborg
+# uses are version-stable from 1.6 through 1.36 (the response shape
+# we depend on - generation, traits, allocations - is identical).
+# We therefore bump every previously 1.6-pinned call site to 1.36 so
+# the negotiation handshake settles at the higher floor.
+SAME_SUBTREE_API_VERSION = '1.36'
 PLACEMENT_CLIENT_SEMAPHORE = 'placement_client'
 
 
@@ -89,7 +98,7 @@ class PlacementClient:
         return res
 
     def _get_rp_traits(self, rp_uuid):
-        resp = self.get(f"/resource_providers/{rp_uuid}/traits", version='1.6')
+        resp = self.get(f"/resource_providers/{rp_uuid}/traits", version=SAME_SUBTREE_API_VERSION)
         if resp.status_code != 200:
             raise Exception(
                 f"Failed to get traits for rp {rp_uuid}:"
@@ -101,13 +110,13 @@ class PlacementClient:
         # TODO(Xinran): maintain a reference count of how many RPs use
         # this trait and do the deletion only when the last RP is deleted.
         for trait_name in trait_names:
-            trait = self.get(f"/traits/{trait_name}", version='1.6')
+            trait = self.get(f"/traits/{trait_name}", version=SAME_SUBTREE_API_VERSION)
             if trait:
                 LOG.info(
                     "Trait %(trait)s already existed", {"trait": trait_name}
                 )
                 continue
-            resp = self.put(f"/traits/{trait_name}", None, version='1.6')
+            resp = self.put(f"/traits/{trait_name}", None, version=SAME_SUBTREE_API_VERSION)
             if resp.status_code == 201:
                 LOG.info("Created trait %(trait)s", {"trait": trait_name})
             else:
@@ -125,7 +134,7 @@ class PlacementClient:
             'traits': traits_json["traits"],
         }
         resp = self.put(
-            f"/resource_providers/{rp_uuid}/traits", payload, version='1.6'
+            f"/resource_providers/{rp_uuid}/traits", payload, version=SAME_SUBTREE_API_VERSION
         )
         if resp.status_code != 200:
             raise Exception(
@@ -254,7 +263,7 @@ class PlacementClient:
     def ensure_resource_provider(
         self, context, uuid, name=None, parent_provider_uuid=None
     ):
-        resp = self.get(f"/resource_providers/{uuid}", version='1.6')
+        resp = self.get(f"/resource_providers/{uuid}", version=SAME_SUBTREE_API_VERSION)
         if resp.status_code == 200:
             LOG.info(
                 "Resource Provider %(uuid)s already exists", {"uuid": uuid}
@@ -403,7 +412,7 @@ class PlacementClient:
 
     def _delete_trait(self, context, name):
         """Delete trait from placement by name."""
-        version = '1.6'
+        version = SAME_SUBTREE_API_VERSION
         resp = self.delete(
             f"/traits/{name}",
             version=version,

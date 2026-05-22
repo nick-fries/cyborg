@@ -62,6 +62,12 @@ intel_qat_driver = "cyborg.accelerator.drivers.qat.intel.driver:IntelQATDriver"
 intel_nic_driver = "cyborg.accelerator.drivers.nic.intel.driver:IntelNICDriver"
 inspur_nvme_ssd_driver = "cyborg.accelerator.drivers.ssd.inspur.driver:InspurNVMeSSDDriver"
 pci_driver = "cyborg.accelerator.drivers.pci.pci.driver:PCIDriver"
+# Phase 3 (PLAN-amd-v620.md §8.5): vendor-agnostic NIC topology driver.
+# Discovers network-class PCI PFs and PATCHes CUSTOM_TOPO_SOCKET<n> /
+# CUSTOM_TOPO_NUMA<n> traits onto Neutron-written Placement RPs so the
+# companion Nova TopologyAffinityFilter can enforce GPU + NIC
+# co-location at either socket or NUMA granularity.
+nic_topology_driver = "cyborg.accelerator.drivers.nic.topology.driver:NICTopologyDriver"
 
 [tool.setuptools]
 packages = ["cyborg"]

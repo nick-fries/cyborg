@@ -26,10 +26,16 @@ PF and VF representation are mutually exclusive at the source:
 * If a PF has ``sriov_numvfs > 0`` one ``DriverDevice`` is emitted per
   VF; the PF itself is skipped.
 
-NUMA awareness is surfaced via per-deployable traits
-(``CUSTOM_AMD_V620_NUMA<n>`` or ``CUSTOM_AMD_V620_NUMA_NONE``) so that
-Nova flavors can request a specific NUMA-affined VF without Cyborg
-needing to model a NUMA sub-RP layer.
+NUMA awareness is surfaced two ways:
+
+* A per-deployable ``CUSTOM_AMD_V620_NUMA<n>`` / ``CUSTOM_AMD_V620_NUMA_NONE``
+  trait, for flavor-side filtering ("give me a VF on NUMA 0").
+* A generic ``numa_node`` DriverAttribute (Phase 2). The Cyborg
+  conductor reads this attribute (driver-agnostic) and parents the
+  deployable RP under a per-NUMA sub-RP when
+  ``[placement] numa_aware_subtree`` is enabled. See PLAN-amd-v620.md
+  §8.4 and the conductor docstring on
+  ``_get_or_create_numa_subprovider``.
 """
 
 import os
@@ -67,6 +73,15 @@ _TRAIT_AMD_V620_VF = "CUSTOM_AMD_V620_VF"
 _TRAIT_AMD_MXGPU = "CUSTOM_AMD_MXGPU"
 _TRAIT_NUMA_NONE = "CUSTOM_AMD_V620_NUMA_NONE"
 _TRAIT_NUMA_PREFIX = "CUSTOM_AMD_V620_NUMA"
+# Phase 3 (PLAN-amd-v620.md §8.5): per-deployable socket trait, mirroring
+# the NUMA trait pattern. ``CUSTOM_AMD_V620_SOCKET_NONE`` is emitted when
+# the socket cannot be read; ``CUSTOM_AMD_V620_SOCKET<n>`` carries the
+# physical_package_id integer for flavor-side filtering. The generic
+# ``socket_id`` DriverAttribute (added in ``_generate_attribute_list``)
+# is what the Cyborg conductor actually keys on when interposing a
+# ``<host>_socket_<n>`` sub-RP above the NUMA sub-RP.
+_TRAIT_SOCKET_NONE = "CUSTOM_AMD_V620_SOCKET_NONE"
+_TRAIT_SOCKET_PREFIX = "CUSTOM_AMD_V620_SOCKET"
 
 
 def _read_numa_node(bdf):
@@ -99,6 +114,28 @@ def _read_numa_node(bdf):
     return value
 
 
+def _read_socket_id(bdf):
+    """Return the CPU socket id (int) for a PCI device, or None.
+
+    Phase 3: thin wrapper around ``gpu_utils.get_socket_id`` so the
+    AMD driver matches the structure of ``_read_numa_node`` while
+    leaving the actual sysfs walk in the shared GPU utils module
+    (where the NIC topology driver also uses it).
+
+    Reads ``/sys/bus/pci/devices/<bdf>/local_cpulist`` to find the
+    first local CPU and resolves its ``physical_package_id``.
+    Returns None on any failure - caller must treat None as
+    "socket unknown".
+    """
+    try:
+        return gpu_utils.get_socket_id(bdf)
+    except Exception as e:
+        LOG.warning(
+            'Failed to read socket_id for device %s: %s', bdf, e,
+        )
+        return None
+
+
 def _read_sriov_numvfs(bdf):
     """Return the current SR-IOV VF count of a PF, or 0 on error.
 
@@ -126,12 +163,26 @@ def _read_sriov_numvfs(bdf):
         return 0
 
 
-def _get_traits(bdf, role):
-    """Build the trait list for a V620 deployable.
+def _get_traits_and_numa(bdf, role):
+    """Build the trait list AND raw numa_node + socket_id for a V620 deployable.
 
-    :param bdf: PCI BDF of the deployable's device (used to read NUMA).
+    :param bdf: PCI BDF of the deployable's device (used to read
+                NUMA + socket).
     :param role: ``"PF"`` or ``"VF"``.
-    :returns: ``{"traits": [...]}`` ready to merge into the gpu_dict.
+    :returns: dict with ``"traits"`` (list[str]), ``"numa_node"``
+              (``str(int)``; ``"-1"`` for no NUMA affinity), and
+              ``"socket_id"`` (``str(int)``; ``"-1"`` if unreadable).
+
+    The generic ``numa_node`` and ``socket_id`` values are exposed as
+    DriverAttributes (see ``_generate_attribute_list``) so the Cyborg
+    conductor's topology-aware sub-RP layer (PLAN §8.4 + §8.5) can
+    parent the deployable RP under a ``<host>_socket_<n>`` ->
+    ``<host>_numa_<n>`` chain. Driver-agnostic by contract: any future
+    driver that emits these keys participates.
+
+    The ``CUSTOM_AMD_V620_NUMA<n>`` and ``CUSTOM_AMD_V620_SOCKET<n>``
+    traits are retained for flavor-side filtering (operator can pin
+    by trait); the generic attributes are for conductor consumption.
     """
     traits = [_TRAIT_OWNER_CYBORG, _TRAIT_AMD_V620]
     if role == "PF":
@@ -143,17 +194,44 @@ def _get_traits(bdf, role):
     numa_node = _read_numa_node(bdf)
     if numa_node is None:
         traits.append(_TRAIT_NUMA_NONE)
+        numa_value = "-1"
     else:
         traits.append("%s%d" % (_TRAIT_NUMA_PREFIX, numa_node))
+        numa_value = str(numa_node)
 
-    return {"traits": traits}
+    socket_id = _read_socket_id(bdf)
+    if socket_id is None or socket_id < 0:
+        traits.append(_TRAIT_SOCKET_NONE)
+        socket_value = "-1"
+    else:
+        traits.append("%s%d" % (_TRAIT_SOCKET_PREFIX, socket_id))
+        socket_value = str(socket_id)
+
+    return {
+        "traits": traits,
+        "numa_node": numa_value,
+        "socket_id": socket_value,
+    }
+
+
+# Backwards-compatible alias - existing callers / tests that imported
+# _get_traits before Phase 2 still work, though no in-tree callers use
+# it after the Phase 2 rewrite.
+def _get_traits(bdf, role):
+    out = _get_traits_and_numa(bdf, role)
+    return {"traits": out["traits"]}
 
 
 def _generate_attribute_list(gpu):
     """Build the DriverAttribute list from a gpu_dict.
 
     Mirrors NVIDIA's _generate_attribute_list - emits ``rc`` and one
-    ``trait<n>`` per trait.
+    ``trait<n>`` per trait. Phase 2 additionally emits a single
+    ``numa_node`` attribute (str(int); ``"-1"`` for no NUMA affinity)
+    when present in the gpu_dict. The Cyborg conductor reads this
+    generic attribute (driver-agnostic key) to decide which per-NUMA
+    sub-RP a deployable RP should be parented under; see
+    ``cyborg/conductor/manager.py::_get_or_create_numa_subprovider``.
     """
     attr_list = []
     index = 0
@@ -169,6 +247,19 @@ def _generate_attribute_list(gpu):
                 )
                 index += 1
                 attr_list.append(driver_attr)
+        if k == "numa_node":
+            driver_attr = driver_attribute.DriverAttribute(
+                key="numa_node", value=str(v),
+            )
+            attr_list.append(driver_attr)
+        if k == "socket_id":
+            # Phase 3: generic socket_id DriverAttribute (str(int); "-1"
+            # for unknown). Read by the conductor's socket-anchor layer
+            # to parent the deployable under <host>_socket_<n>.
+            driver_attr = driver_attribute.DriverAttribute(
+                key="socket_id", value=str(v),
+            )
+            attr_list.append(driver_attr)
     return attr_list
 
 
@@ -305,7 +396,7 @@ def _discover_v620(vendor_id):
         if numvfs <= 0:
             # PF-only mode - emit the PF, no VFs.
             pf_info["rc"] = constants.RESOURCES["PGPU"]
-            pf_info.update(_get_traits(pf_bdf, role="PF"))
+            pf_info.update(_get_traits_and_numa(pf_bdf, role="PF"))
             devices.append(_generate_driver_device(pf_info))
         else:
             # VF mode - emit one DriverDevice per VF; skip the PF.
@@ -313,7 +404,7 @@ def _discover_v620(vendor_id):
                 vf_info = vfs[vf_bdf]
                 vf_info['parent_pf'] = pf_bdf
                 vf_info["rc"] = constants.RESOURCES["PGPU"]
-                vf_info.update(_get_traits(vf_bdf, role="VF"))
+                vf_info.update(_get_traits_and_numa(vf_bdf, role="VF"))
                 devices.append(_generate_driver_device(vf_info))
                 handled_vfs.add(vf_bdf)
 
@@ -327,7 +418,7 @@ def _discover_v620(vendor_id):
         if parent:
             vf_info['parent_pf'] = parent
         vf_info["rc"] = constants.RESOURCES["PGPU"]
-        vf_info.update(_get_traits(vf_bdf, role="VF"))
+        vf_info.update(_get_traits_and_numa(vf_bdf, role="VF"))
         devices.append(_generate_driver_device(vf_info))
 
     return devices

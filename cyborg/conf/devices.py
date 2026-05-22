@@ -120,6 +120,68 @@ additional V620-class VFs.
 ]
 
 
+# Phase 3 (PLAN-amd-v620.md §8.5): NIC topology driver options.
+# The driver is vendor-agnostic and writes locality traits onto
+# Neutron-written Placement RPs. Operators opt in by setting
+# ``[nic_topology] enabled = True``. The defaults are tuned for
+# the common case (Ethernet NICs, the standard
+# ``CUSTOM_TOPO_SOCKET<n>`` / ``CUSTOM_TOPO_NUMA<n>`` trait names
+# used by the companion Nova ``TopologyAffinityFilter``); operators
+# with unusual hardware or naming conventions can override.
+nic_topology_group = cfg.OptGroup(
+    name='nic_topology',
+    title='NIC topology driver',
+    help=(
+        "Configuration for the vendor-agnostic NIC topology driver "
+        "(Cyborg V620 / topology-aware-scheduling fork, PLAN "
+        "§8.5). Discovers network-class PCI Physical Functions on "
+        "the local host and PATCHes locality traits onto the "
+        "corresponding Neutron-written Placement resource providers."
+    ),
+)
+
+nic_topology_opts = [
+    cfg.BoolOpt(
+        'enabled',
+        default=False,
+        help="""
+Enable the NIC topology driver. When False (default) the driver is
+loaded by stevedore but its ``discover()`` returns immediately
+without touching Placement. Operators must explicitly opt in.
+""",
+    ),
+    cfg.ListOpt(
+        'pci_class_prefixes',
+        default=['02'],
+        help="""
+PCI class-word prefixes that the topology driver treats as network
+controllers. Default ``['02']`` matches every network controller
+sub-class (Ethernet 0200, Infiniband 0207, etc). Narrow this to
+``['0207']`` for an Infiniband-only deployment or expand it for
+unusual hardware. Values are case-insensitive hex without ``0x``.
+""",
+    ),
+    cfg.StrOpt(
+        'socket_trait_prefix',
+        default='CUSTOM_TOPO_SOCKET',
+        help="""
+Trait-name prefix for the per-socket locality trait. The driver
+appends the integer socket id (e.g. ``CUSTOM_TOPO_SOCKET0``).
+Must match what the Nova ``TopologyAffinityFilter`` reads.
+""",
+    ),
+    cfg.StrOpt(
+        'numa_trait_prefix',
+        default='CUSTOM_TOPO_NUMA',
+        help="""
+Trait-name prefix for the per-NUMA-node locality trait. The driver
+appends the integer NUMA node id (e.g. ``CUSTOM_TOPO_NUMA0``).
+Must match what the Nova ``TopologyAffinityFilter`` reads.
+""",
+    ),
+]
+
+
 def register_opts(conf):
     conf.register_group(nic_group)
     conf.register_opts(nic_opts, group=nic_group)
@@ -127,6 +189,8 @@ def register_opts(conf):
     conf.register_opts(vgpu_opts, group=gpu_group)
     conf.register_group(pci_group)
     conf.register_opts(pci_opts, group=pci_group)
+    conf.register_group(nic_topology_group)
+    conf.register_opts(nic_topology_opts, group=nic_topology_group)
 
 
 def register_dynamic_opts(conf):
@@ -163,4 +227,8 @@ def register_dynamic_opts(conf):
 
 
 def list_opts():
-    return {nic_group: nic_opts, gpu_group: vgpu_opts}
+    return {
+        nic_group: nic_opts,
+        gpu_group: vgpu_opts,
+        nic_topology_group: nic_topology_opts,
+    }

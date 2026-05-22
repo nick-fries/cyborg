@@ -106,3 +106,55 @@ def get_physfn(bdf):
     except OSError:
         return None
     return os.path.basename(target)
+
+
+def get_socket_id(bdf):
+    """Return the CPU socket (physical_package_id) for a PCI device, or None.
+
+    Phase 3 (PLAN-amd-v620.md §8.5): generic helper used by any
+    driver (GPU, NIC, future accelerators) that needs to surface the
+    PCI device's containing CPU socket so the Cyborg conductor can
+    parent the deployable RP under a ``<host>_socket_<n>`` anchor.
+
+    Implementation:
+
+    1. Read ``/sys/bus/pci/devices/<bdf>/local_cpulist`` (a comma-
+       separated, optionally hyphen-ranged list like ``"0-15,32-47"``
+       that names the host CPUs local to the device).
+    2. Parse out the first CPU id from the first range.
+    3. Read ``/sys/devices/system/cpu/cpu<N>/topology/physical_package_id``
+       and return that integer.
+
+    Returns ``None`` on any I/O or parse error - callers must treat
+    None as "socket unknown" (graceful degradation: deployable
+    parents directly under the host root, not under a socket anchor).
+    """
+    cpulist_path = '/sys/bus/pci/devices/%s/local_cpulist' % bdf
+    try:
+        with open(cpulist_path) as f:
+            raw = f.read().strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    # First entry can be "0", "0-15", "0-15,32-47", etc. Take the
+    # leading integer of the first range.
+    first_token = raw.split(',', 1)[0].strip()
+    first_cpu_str = first_token.split('-', 1)[0].strip()
+    try:
+        first_cpu = int(first_cpu_str)
+    except ValueError:
+        return None
+    pkg_path = (
+        '/sys/devices/system/cpu/cpu%d/topology/physical_package_id'
+        % first_cpu
+    )
+    try:
+        with open(pkg_path) as f:
+            raw = f.read().strip()
+    except OSError:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None

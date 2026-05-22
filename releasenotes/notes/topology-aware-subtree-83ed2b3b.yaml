@@ -1,0 +1,38 @@
+---
+features:
+  - |
+    Cyborg now builds a two-level topology anchor tree (socket above
+    NUMA) when ``[placement] numa_aware_subtree`` is enabled. Each
+    discovered accelerator deployable is parented under
+    ``<host>_socket_<n>`` (trait ``CUSTOM_SOCKET_ROOT``) and
+    ``<host>_numa_<n>`` (trait ``HW_NUMA_ROOT``), producing a tree
+    that supports either socket-level or NUMA-level co-location via
+    Placement ``same_subtree`` queries.
+
+    A new vendor-agnostic NIC topology driver
+    (``nic_topology_driver``) discovers network-class PCI devices on
+    each compute host, derives their socket/NUMA from sysfs, and
+    PATCHes ``CUSTOM_TOPO_SOCKET<n>`` / ``CUSTOM_TOPO_NUMA<n>``
+    traits onto the corresponding Neutron-written Placement RPs.
+    This bridges Cyborg-managed accelerator topology to
+    Neutron-managed NIC RPs without modifying Neutron or moving its
+    RPs into Cyborg's tree.
+
+    Combined with Nova's new ``TopologyAffinityFilter`` (added in
+    the matching Nova patch), operators can write flavors with
+    ``hw:cyborg_locality=socket`` or ``hw:cyborg_locality=numa`` to
+    require GPU and NIC co-location at the chosen granularity.
+upgrade:
+  - |
+    The ``[placement] numa_aware_subtree`` flag now controls both
+    the socket and NUMA sub-RP layers; semantics are backwards
+    compatible. Operators upgrading from a Phase 2 deployment will
+    see the existing NUMA sub-RPs re-parented under new socket
+    anchors on the next conductor reconcile.
+
+    The NIC topology driver is disabled by default
+    (``[nic_topology] enabled = False``). Enabling it on a host
+    will cause the agent to PATCH locality traits onto any
+    Neutron-written Placement RP whose name contains a discovered
+    PF's BDF; existing traits on those RPs are not modified
+    (the PATCH is additive).

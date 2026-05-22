@@ -109,6 +109,9 @@ class TestAMDSysinfo(base.TestCase):
         mock_open.side_effect = _SysfsMock({
             '/sys/bus/pci/devices/0000:c1:00.0/sriov_numvfs': '0',
             '/sys/bus/pci/devices/0000:c1:00.0/numa_node': '0',
+            # Phase 3: socket discovery walks local_cpulist -> physical_package_id.
+            '/sys/bus/pci/devices/0000:c1:00.0/local_cpulist': '0-15,32-47',
+            '/sys/devices/system/cpu/cpu0/topology/physical_package_id': '0',
         })
 
         devs = AMDGPUDriver().discover()
@@ -123,6 +126,14 @@ class TestAMDSysinfo(base.TestCase):
         self.assertIn('CUSTOM_AMD_V620_NUMA0', traits)
         self.assertNotIn('CUSTOM_AMD_V620_VF', traits)
         self.assertNotIn('CUSTOM_AMD_MXGPU', traits)
+        # Phase 2: generic numa_node DriverAttribute is emitted alongside
+        # the CUSTOM_AMD_V620_NUMA<n> trait for the conductor sub-RP layer.
+        self.assertEqual('0', attrs['numa_node'])
+        # Phase 3: socket_id DriverAttribute and CUSTOM_AMD_V620_SOCKET<n>
+        # trait emitted alongside numa_node.
+        self.assertEqual('0', attrs['socket_id'])
+        self.assertIn('CUSTOM_AMD_V620_SOCKET0', traits)
+        self.assertNotIn('CUSTOM_AMD_V620_SOCKET_NONE', traits)
         # cpid is the PF's own BDF
         cpid = jsonutils.loads(devs[0].controlpath_id.cpid_info)
         self.assertEqual('c1', cpid['bus'])
@@ -162,6 +173,9 @@ class TestAMDSysinfo(base.TestCase):
             self.assertIn('CUSTOM_AMD_MXGPU', traits)
             self.assertIn('CUSTOM_AMD_V620_NUMA0', traits)
             self.assertNotIn('CUSTOM_AMD_V620_PF', traits)
+            # Phase 2: VF deployables also carry the generic numa_node
+            # attribute for conductor consumption.
+            self.assertEqual('0', attrs['numa_node'])
             cpid = jsonutils.loads(dev.controlpath_id.cpid_info)
             # Each VF must use its own BDF as the cpid (a distinct RP).
             self.assertEqual('c1', cpid['bus'])
@@ -191,7 +205,8 @@ class TestAMDSysinfo(base.TestCase):
         devs = AMDGPUDriver().discover()
 
         self.assertEqual(1, len(devs))
-        traits = _trait_values(_attribute_dict(devs[0]))
+        attrs = _attribute_dict(devs[0])
+        traits = _trait_values(attrs)
         self.assertIn('CUSTOM_AMD_V620_NUMA_NONE', traits)
         for t in traits:
             self.assertFalse(
@@ -199,6 +214,8 @@ class TestAMDSysinfo(base.TestCase):
                 and t != 'CUSTOM_AMD_V620_NUMA_NONE',
                 'Unexpected NUMA trait %s' % t,
             )
+        # Phase 2: numa_node attribute is "-1" when no NUMA affinity.
+        self.assertEqual('-1', attrs['numa_node'])
 
     # --- Test 4: NUMA OSError (sysfs read fails) ----------------------
     @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
@@ -218,8 +235,11 @@ class TestAMDSysinfo(base.TestCase):
         devs = AMDGPUDriver().discover()
 
         self.assertEqual(1, len(devs))
-        traits = _trait_values(_attribute_dict(devs[0]))
+        attrs = _attribute_dict(devs[0])
+        traits = _trait_values(attrs)
         self.assertIn('CUSTOM_AMD_V620_NUMA_NONE', traits)
+        # Phase 2: numa_node attribute is "-1" on sysfs OSError too.
+        self.assertEqual('-1', attrs['numa_node'])
 
     # --- Test 5: Multi-NUMA (2 PFs on different sockets) --------------
     @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
@@ -241,12 +261,18 @@ class TestAMDSysinfo(base.TestCase):
 
         self.assertEqual(2, len(devs))
         traits_by_bdf = {}
+        numa_by_bdf = {}
         for dev in devs:
             cpid = jsonutils.loads(dev.controlpath_id.cpid_info)
             bdf_key = cpid['bus']
-            traits_by_bdf[bdf_key] = _trait_values(_attribute_dict(dev))
+            attrs = _attribute_dict(dev)
+            traits_by_bdf[bdf_key] = _trait_values(attrs)
+            numa_by_bdf[bdf_key] = attrs.get('numa_node')
         self.assertIn('CUSTOM_AMD_V620_NUMA0', traits_by_bdf['c1'])
         self.assertIn('CUSTOM_AMD_V620_NUMA1', traits_by_bdf['e1'])
+        # Phase 2: per-BDF numa_node attribute consistent with the trait.
+        self.assertEqual('0', numa_by_bdf['c1'])
+        self.assertEqual('1', numa_by_bdf['e1'])
 
     # --- Test 6: Stevedore entry-point resolves ----------------------
     def test_stevedore_entrypoint(self):
@@ -288,3 +314,46 @@ class TestAMDSysinfoHelpers(base.TestCase):
             'builtins.open', side_effect=OSError('no such file'),
         ):
             self.assertEqual(0, sysinfo._read_sriov_numvfs('0000:c1:00.0'))
+
+
+    def test_read_socket_id_happy_path(self):
+        """Phase 3: socket_id resolves via local_cpulist -> package_id."""
+        files = {
+            '/sys/bus/pci/devices/0000:c1:00.0/local_cpulist':
+                '0-15,32-47',
+            '/sys/devices/system/cpu/cpu0/topology/physical_package_id': '1',
+        }
+
+        def _open(path, *a, **kw):
+            if path not in files:
+                raise FileNotFoundError(path)
+            return mock.mock_open(read_data=files[path]).return_value
+
+        with mock.patch('builtins.open', side_effect=_open):
+            self.assertEqual(
+                1, sysinfo._read_socket_id('0000:c1:00.0'),
+            )
+
+    def test_read_socket_id_single_cpu(self):
+        """A 1-socket / 1-core test mock: cpulist is just '0'."""
+        files = {
+            '/sys/bus/pci/devices/0000:c1:00.0/local_cpulist': '0',
+            '/sys/devices/system/cpu/cpu0/topology/physical_package_id': '0',
+        }
+
+        def _open(path, *a, **kw):
+            if path not in files:
+                raise FileNotFoundError(path)
+            return mock.mock_open(read_data=files[path]).return_value
+
+        with mock.patch('builtins.open', side_effect=_open):
+            self.assertEqual(
+                0, sysinfo._read_socket_id('0000:c1:00.0'),
+            )
+
+    def test_read_socket_id_unreadable(self):
+        """OSError on either sysfs file -> None; never raises."""
+        with mock.patch(
+            'builtins.open', side_effect=OSError('boom'),
+        ):
+            self.assertIsNone(sysinfo._read_socket_id('0000:c1:00.0'))

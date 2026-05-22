@@ -191,7 +191,8 @@ class ConductorManager:
             for driver_dep_obj in new_driver_dev_obj.deployable_list:
                 try:
                     self.get_placement_needed_info_and_report(
-                        context, driver_dep_obj, host_rp
+                        context, driver_dep_obj, host_rp,
+                        host_name=host,
                     )
                 except Exception as exc:
                     LOG.info(
@@ -243,6 +244,7 @@ class ConductorManager:
                 old_driver_dev_obj.deployable_list,
                 new_driver_dev_obj.deployable_list,
                 host_rp,
+                host_name=host,
             )
 
     def drv_deployable_make_diff(
@@ -253,6 +255,7 @@ class ConductorManager:
         old_driver_dep_list,
         new_driver_dep_list,
         host_rp,
+        host_name=None,
     ):
         """Compare new driver-side deployable object list with the old one in
         one host.
@@ -280,7 +283,8 @@ class ConductorManager:
             new_driver_dep_obj.create(context, device_id, cpid_id)
             try:
                 self.get_placement_needed_info_and_report(
-                    context, new_driver_dep_obj, host_rp
+                    context, new_driver_dep_obj, host_rp,
+                    host_name=host_name,
                 )
             except Exception as exc:
                 LOG.info(
@@ -455,8 +459,189 @@ class ConductorManager:
         else:
             raise exception.Conflict()
 
+    # ---- Phase 2 (PLAN-amd-v620.md §8.4): NUMA-aware sub-RP layer ----
+    # When [placement] numa_aware_subtree is True, deployable RPs are
+    # parented under a per-NUMA sub-RP named "<host>_numa_<n>" so that
+    # Nova's same_subtree= queries can co-locate GPU + NIC + CPU on the
+    # same NUMA node. Driver-agnostic: any driver that emits a generic
+    # ``numa_node`` DriverAttribute participates.
+    #
+    # DROP WHEN NOVA LANDS nova-spec-numa-topology-with-rps.
+
+    @staticmethod
+    def _numa_aware_enabled():
+        return bool(getattr(CONF.placement, 'numa_aware_subtree', False))
+
+    @staticmethod
+    def _extract_numa_node(obj):
+        """Read the generic ``numa_node`` DriverAttribute from a dep obj.
+
+        Returns the int value when present and parseable, else None.
+        Value ``-1`` is normalized to None ("no NUMA affinity").
+        """
+        for attr in getattr(obj, 'attribute_list', []) or []:
+            if getattr(attr, 'key', None) == 'numa_node':
+                try:
+                    n = int(attr.value)
+                except (TypeError, ValueError):
+                    return None
+                return n if n >= 0 else None
+        return None
+
+    @staticmethod
+    def _extract_socket_id(obj):
+        """Read the generic ``socket_id`` DriverAttribute from a dep obj.
+
+        Phase 3 (PLAN-amd-v620.md §8.5): mirrors ``_extract_numa_node``
+        for the new per-CPU-socket anchor layer. ``-1`` normalizes to
+        None ("socket unknown"); callers must treat None as "no
+        socket anchor, parent under host root directly".
+        """
+        for attr in getattr(obj, 'attribute_list', []) or []:
+            if getattr(attr, 'key', None) == 'socket_id':
+                try:
+                    n = int(attr.value)
+                except (TypeError, ValueError):
+                    return None
+                return n if n >= 0 else None
+        return None
+
+    @staticmethod
+    def _numa_subprovider_name(host_name, numa_node):
+        """Return the canonical "<host>_numa_<n>" sub-RP name."""
+        return "%s_numa_%d" % (host_name, int(numa_node))
+
+    @staticmethod
+    def _socket_subprovider_name(host_name, socket_id):
+        """Return the canonical "<host>_socket_<n>" sub-RP name."""
+        return "%s_socket_%d" % (host_name, int(socket_id))
+
+    def _get_or_create_numa_subprovider(
+        self, context, parent_rp_uuid, host_name, numa_node,
+    ):
+        """Idempotently return the UUID of the per-NUMA sub-RP.
+
+        For ``numa_node == -1`` (no NUMA affinity) returns
+        ``parent_rp_uuid`` unchanged - the deployable then parents
+        directly under whatever was passed in (host root, or in Phase
+        3 the new ``<host>_socket_<n>`` anchor when one was created),
+        matching today's degraded behavior.
+
+        Phase 3 change: the second positional argument was renamed
+        from ``host_rp_uuid`` to ``parent_rp_uuid`` because the parent
+        is no longer always the host root. When the new socket
+        anchor layer is active, callers pass the socket sub-RP UUID
+        here so NUMA sub-RPs become children of the socket anchor
+        rather than direct children of the host root. The host_name
+        argument is still used to construct the deterministic
+        sub-RP name (and therefore its deterministic UUID) so the
+        NUMA RP UUID is stable across socket/no-socket configurations.
+
+        Otherwise computes a deterministic UUID from the sub-RP name
+        (uuid3 of "<host>_numa_<n>"), ensures the RP exists under the
+        passed-in parent via placement_client.ensure_resource_provider,
+        and tags it with the standard ``HW_NUMA_ROOT`` os-traits trait
+        so that downstream services know this RP represents a NUMA node.
+        """
+        if numa_node is None or int(numa_node) < 0:
+            return parent_rp_uuid
+        sub_name = self._numa_subprovider_name(host_name, numa_node)
+        deterministic_uuid = str(
+            uuid.uuid3(uuid.NAMESPACE_DNS, sub_name)
+        )
+        sub_uuid = self.placement_client.ensure_resource_provider(
+            context,
+            deterministic_uuid,
+            name=sub_name,
+            parent_provider_uuid=parent_rp_uuid,
+        )
+        # ensure_resource_provider returns the existing UUID if a RP
+        # with that UUID already exists. If the deterministic UUID we
+        # computed clashes with something else (unlikely - we hash the
+        # sub-RP's name) treat it as a hard conflict.
+        if sub_uuid != deterministic_uuid:
+            raise exception.Conflict()
+        # Tag the sub-RP as a NUMA root. add_traits_to_rp is idempotent.
+        try:
+            self.placement_client.add_traits_to_rp(
+                sub_uuid, ['HW_NUMA_ROOT'],
+            )
+        except Exception as exc:
+            # Trait tagging failure is non-fatal - the RP exists and is
+            # usable. Log and move on; tag will retry on next report.
+            LOG.warning(
+                "Failed to tag NUMA sub-RP %(uuid)s (%(name)s) with "
+                "HW_NUMA_ROOT: %(err)s",
+                {'uuid': sub_uuid, 'name': sub_name, 'err': exc},
+            )
+        return sub_uuid
+
+    def _get_or_create_socket_subprovider(
+        self, context, host_rp_uuid, host_name, socket_id,
+    ):
+        """Idempotently return the UUID of the per-socket sub-RP.
+
+        Phase 3 (PLAN-amd-v620.md §8.5): the socket anchor sits
+        between the compute host root and the NUMA sub-RPs from
+        Phase 2. The result is a host -> socket -> NUMA -> device
+        tree that lets Nova co-locate accel+NIC at either socket or
+        NUMA granularity via Placement ``same_subtree=`` queries.
+
+        For ``socket_id == -1`` (unreadable) returns ``host_rp_uuid``
+        unchanged - the NUMA sub-RP (or the deployable, when
+        ``numa_node == -1`` too) then parents directly under the
+        host root, matching the pre-Phase-3 degraded shape.
+        Single-socket hosts (``socket_id == 0``) get a single
+        ``<host>_socket_0`` anchor - we do NOT special-case the 1P
+        case, because that would mean 1P and 2P hosts have
+        different tree shapes for no operational benefit.
+
+        Computes a deterministic UUID from the sub-RP name
+        (uuid3 of "<host>_socket_<n>"), ensures the RP exists
+        under the host root via
+        ``placement_client.ensure_resource_provider``, and tags it
+        with the ``CUSTOM_SOCKET_ROOT`` trait so downstream services
+        (including the Nova ``TopologyAffinityFilter`` in the
+        companion patch) can walk the tree and recognize the anchor.
+        """
+        if socket_id is None or int(socket_id) < 0:
+            return host_rp_uuid
+        sub_name = self._socket_subprovider_name(host_name, socket_id)
+        deterministic_uuid = str(
+            uuid.uuid3(uuid.NAMESPACE_DNS, sub_name)
+        )
+        sub_uuid = self.placement_client.ensure_resource_provider(
+            context,
+            deterministic_uuid,
+            name=sub_name,
+            parent_provider_uuid=host_rp_uuid,
+        )
+        if sub_uuid != deterministic_uuid:
+            raise exception.Conflict()
+        # Tag the socket anchor. CUSTOM_SOCKET_ROOT is not (yet) part
+        # of os-traits proper; using a CUSTOM_ prefix is the
+        # documented escape hatch for site-defined traits and is
+        # idempotent through ``add_traits_to_rp``.
+        try:
+            self.placement_client.add_traits_to_rp(
+                sub_uuid, ['CUSTOM_SOCKET_ROOT'],
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Failed to tag socket sub-RP %(uuid)s (%(name)s) "
+                "with CUSTOM_SOCKET_ROOT: %(err)s",
+                {'uuid': sub_uuid, 'name': sub_name, 'err': exc},
+            )
+        return sub_uuid
+
     def provider_report(
-        self, context, name, resource_class, traits, total, parent
+        self,
+        context,
+        name,
+        resource_class,
+        traits,
+        total,
+        parent,
     ):
         self.placement_client.ensure_resource_classes(
             context, [resource_class]
@@ -473,15 +658,50 @@ class ConductorManager:
         return sub_pr_uuid
 
     def get_placement_needed_info_and_report(
-        self, context, obj, parent_uuid=None
+        self, context, obj, parent_uuid=None, host_name=None,
     ):
         pr_name = obj.name
         attrs = obj.attribute_list
         resource_class = [i.value for i in attrs if i.key == 'rc'][0]
         traits = [i.value for i in attrs if str(i.key).startswith("trait")]
         total = obj.num_accelerators
+
+        # Phase 2 + Phase 3: optionally interpose a per-socket and
+        # per-NUMA sub-RP between the host root and the deployable RP.
+        # Gated on the config flag and on the driver having emitted
+        # usable socket_id / numa_node attributes. The shape is:
+        #
+        #   host_root
+        #     └── <host>_socket_<s>   (CUSTOM_SOCKET_ROOT)   <- Phase 3
+        #           └── <host>_numa_<n>  (HW_NUMA_ROOT)      <- Phase 2
+        #                 └── deployable
+        #
+        # On 1P hosts the socket anchor is still created (socket_0) -
+        # we intentionally do NOT special-case 1P, so the tree shape
+        # is identical regardless of socket count. ``socket_id == -1``
+        # (unreadable) gracefully degrades to today's flat-or-NUMA
+        # shape because ``_get_or_create_socket_subprovider`` returns
+        # the host root unchanged for negative socket ids.
+        effective_parent = parent_uuid
+        if (
+            self._numa_aware_enabled()
+            and parent_uuid is not None
+            and host_name is not None
+        ):
+            socket_id = self._extract_socket_id(obj)
+            if socket_id is not None:
+                effective_parent = self._get_or_create_socket_subprovider(
+                    context, effective_parent, host_name, socket_id,
+                )
+            numa_node = self._extract_numa_node(obj)
+            if numa_node is not None:
+                effective_parent = self._get_or_create_numa_subprovider(
+                    context, effective_parent, host_name, numa_node,
+                )
+
         rp_uuid = self.provider_report(
-            context, pr_name, resource_class, traits, total, parent_uuid
+            context, pr_name, resource_class, traits, total,
+            effective_parent,
         )
         dep_obj = Deployable.get_by_name(context, pr_name)
         dep_obj["rp_uuid"] = rp_uuid
@@ -490,19 +710,250 @@ class ConductorManager:
     def get_rp_uuid_from_obj(self, obj):
         return str(uuid.uuid3(uuid.NAMESPACE_DNS, str(obj.name)))
 
+    def _has_allocations(self, context, rp_uuid):
+        """Return True if any consumer currently holds resources on rp_uuid.
+
+        Phase 2 (PLAN-amd-v620.md §8.4): used by the deferred-RP-delete
+        guard. We never delete an RP that has live allocations - doing
+        so would orphan a Nova instance's hold. Returns False on any
+        client error (caller falls through to the legacy delete path,
+        which itself surfaces 409 if Placement rejects).
+        """
+        try:
+            resp = self.placement_client.get(
+                "/resource_providers/%s/allocations" % rp_uuid,
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Failed to query allocations for RP %(uuid)s: %(err)s; "
+                "assuming none.",
+                {'uuid': rp_uuid, 'err': exc},
+            )
+            return False
+        if resp is None or getattr(resp, 'status_code', 500) != 200:
+            return False
+        try:
+            body = resp.json()
+        except Exception:
+            return False
+        return bool(body.get('allocations'))
+
+    # In-memory set of RP UUIDs whose delete was deferred because they
+    # had live allocations. The agent re-issues report_data periodically;
+    # next pass the conductor will retry. A future improvement (out of
+    # scope for Phase 2) would persist this in the DB; the in-memory
+    # variant is sufficient because all deferred RPs are also still
+    # present in Cyborg's device/deployable tables and naturally
+    # re-attempt deletion on subsequent reconciles.
+    _deferred_delete_rp_uuids: set = set()
+
     def _delete_provider_and_sub_providers(self, context, rp_uuid):
         rp_in_tree = self.placement_client.get_providers_in_tree(
             context, rp_uuid
         )
+        # Phase 2: identify potential NUMA-sub-RP parents that may
+        # become eligible for garbage collection once this rp_uuid and
+        # its children are gone. We compute the set BEFORE delete by
+        # looking at the parent_provider_uuid of rp_uuid (the entry
+        # whose ``uuid == rp_uuid``).
+        parent_uuid_of_target = None
+        if self._numa_aware_enabled():
+            for rp in rp_in_tree:
+                if rp["uuid"] == rp_uuid:
+                    parent_uuid_of_target = rp.get("parent_provider_uuid")
+                    break
+
+        deferred_any = False
         for rp in rp_in_tree[::-1]:
             if rp["parent_provider_uuid"] == rp_uuid or rp["uuid"] == rp_uuid:
+                # Deferred-delete guard: never delete an RP with live
+                # allocations. We log + record + skip, then continue
+                # the iteration so we still try to delete other (non-
+                # allocated) RPs in the subtree. The next reconcile
+                # cycle naturally retries because the device/deployable
+                # remains in the Cyborg DB.
+                if self._has_allocations(context, rp["uuid"]):
+                    LOG.warning(
+                        "Deferred RP delete for %(uuid)s: allocations "
+                        "present; will retry on next reconcile.",
+                        {'uuid': rp["uuid"]},
+                    )
+                    self._deferred_delete_rp_uuids.add(rp["uuid"])
+                    deferred_any = True
+                    if rp["uuid"] == rp_uuid:
+                        # Can't proceed any further up the chain since
+                        # the target itself can't go.
+                        break
+                    continue
                 self.placement_client.delete_provider(rp["uuid"])
                 LOG.info(
                     "Successfully delete resource provider %(rp_uuid)s",
                     {"rp_uuid": rp["uuid"]},
                 )
+                self._deferred_delete_rp_uuids.discard(rp["uuid"])
                 if rp["uuid"] == rp_uuid:
                     break
+
+        # Phase 2: garbage-collect the parent NUMA sub-RP when it is
+        # now childless. Only applies when (a) the flag is on, (b)
+        # the immediate parent is not the host root (host roots are
+        # owned by nova-compute and must never be deleted by Cyborg),
+        # and (c) no allocations remain on the parent. We detect "is
+        # a host root" heuristically: a host root has no parent of
+        # its own. We compare via a fresh in_tree fetch rooted at the
+        # parent.
+        if (
+            self._numa_aware_enabled()
+            and parent_uuid_of_target
+            and not deferred_any
+        ):
+            # Phase 2: gc the NUMA sub-RP if it is now empty.
+            self._maybe_gc_numa_subprovider(context, parent_uuid_of_target)
+            # Phase 3: if the NUMA sub-RP got gc'd, its own parent (the
+            # socket sub-RP) may now be empty too. Chain the gc up one
+            # level. ``_maybe_gc_socket_subprovider`` is safe to call
+            # unconditionally - it short-circuits if the candidate is
+            # not actually a socket anchor or still has children.
+            self._maybe_gc_socket_subprovider(
+                context, parent_uuid_of_target,
+            )
+
+    def _maybe_gc_socket_subprovider(self, context, child_uuid):
+        """Garbage-collect an empty socket sub-RP after a NUMA gc.
+
+        Phase 3 helper. ``child_uuid`` is the UUID of an RP that was
+        a child of the socket sub-RP we want to gc. We look up its
+        current row in Placement to find its parent (the socket
+        anchor) and, if the parent is in fact a socket anchor with
+        no remaining children and no allocations, delete it.
+
+        The function is intentionally lenient: any failure - the
+        child has already been deleted, the parent is not a socket
+        anchor, the parent still has siblings - is a silent no-op.
+        The next reconcile naturally retries if needed.
+        """
+        # First find the socket-anchor candidate by looking up the
+        # child's parent_provider_uuid via the in-tree fetch.
+        try:
+            in_tree = self.placement_client.get_providers_in_tree(
+                context, child_uuid,
+            )
+        except Exception as exc:
+            LOG.debug(
+                "Socket sub-RP gc skipped: in_tree for %(uuid)s "
+                "failed: %(err)s",
+                {'uuid': child_uuid, 'err': exc},
+            )
+            return
+        # If the child still exists, its parent is the candidate.
+        # If it doesn't (NUMA gc succeeded), look up the parent we
+        # captured during the original in_tree at the top of
+        # _delete_provider_and_sub_providers - but we don't have it
+        # here, so fall through: the parent candidate is the entry
+        # in in_tree whose ``children == 0`` and whose name matches
+        # the socket pattern. We probe each candidate.
+        candidates = set()
+        for rp in in_tree:
+            if rp["uuid"] == child_uuid:
+                pp = rp.get("parent_provider_uuid")
+                if pp:
+                    candidates.add(pp)
+        # Independently scan: any RP in the tree whose name matches
+        # the socket pattern and has no children is also a candidate
+        # (covers the case where the NUMA gc already removed the
+        # child by the time we got here).
+        children_by_parent = {}
+        for rp in in_tree:
+            pp = rp.get("parent_provider_uuid")
+            if pp:
+                children_by_parent.setdefault(pp, 0)
+                children_by_parent[pp] += 1
+        for rp in in_tree:
+            name = rp.get("name") or ""
+            if "_socket_" not in name:
+                continue
+            if children_by_parent.get(rp["uuid"], 0) == 0:
+                candidates.add(rp["uuid"])
+
+        for candidate in candidates:
+            self._maybe_gc_anchor_subprovider(
+                context, candidate, name_marker="_socket_",
+            )
+
+    def _maybe_gc_anchor_subprovider(
+        self, context, candidate_uuid, name_marker,
+    ):
+        """Generic empty-anchor RP gc used by both NUMA + socket layers.
+
+        Phase 3 refactor of the Phase 2 NUMA gc. Safe to call on any
+        UUID: short-circuits if the RP is not an anchor (no parent,
+        or name doesn't contain ``name_marker``), still has children,
+        or has live allocations. Failures are logged and swallowed.
+        """
+        try:
+            in_tree = self.placement_client.get_providers_in_tree(
+                context, candidate_uuid,
+            )
+        except Exception as exc:
+            LOG.debug(
+                "Anchor sub-RP gc skipped for %(uuid)s: in_tree "
+                "fetch failed: %(err)s",
+                {'uuid': candidate_uuid, 'err': exc},
+            )
+            return
+
+        target = None
+        children = []
+        for rp in in_tree:
+            if rp["uuid"] == candidate_uuid:
+                target = rp
+            elif rp.get("parent_provider_uuid") == candidate_uuid:
+                children.append(rp)
+        if target is None:
+            return
+        # Never gc a host root (parent_provider_uuid is None).
+        if not target.get("parent_provider_uuid"):
+            return
+        # Never gc if it still has any children.
+        if children:
+            return
+        # Never gc if it has live allocations.
+        if self._has_allocations(context, candidate_uuid):
+            LOG.info(
+                "Skipping anchor sub-RP gc for %(uuid)s: live "
+                "allocations.",
+                {'uuid': candidate_uuid},
+            )
+            return
+        # Belt-and-suspenders: name marker must match (avoids gc'ing
+        # an unrelated sub-RP whose UUID happened to be passed in).
+        name = target.get("name") or ""
+        if name_marker not in name:
+            return
+        try:
+            self.placement_client.delete_provider(candidate_uuid)
+            LOG.info(
+                "Garbage-collected empty anchor sub-RP %(uuid)s "
+                "(%(name)s).",
+                {'uuid': candidate_uuid, 'name': name},
+            )
+        except Exception as exc:
+            LOG.warning(
+                "Failed to gc anchor sub-RP %(uuid)s: %(err)s",
+                {'uuid': candidate_uuid, 'err': exc},
+            )
+
+    def _maybe_gc_numa_subprovider(self, context, candidate_uuid):
+        """Delete a NUMA sub-RP if it is empty and not a host root.
+
+        Phase 2 helper, Phase 3 refactor: now delegates to the generic
+        ``_maybe_gc_anchor_subprovider`` with ``name_marker="_numa_"``.
+        Kept as a separate method so test code and future callers can
+        target the NUMA layer explicitly.
+        """
+        self._maybe_gc_anchor_subprovider(
+            context, candidate_uuid, name_marker="_numa_",
+        )
 
 
 def _gen_resource_inventory(resource_class, total):
