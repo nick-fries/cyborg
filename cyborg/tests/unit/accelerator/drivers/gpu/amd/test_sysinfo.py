@@ -39,21 +39,14 @@ V620_VF_INFO_TEMPLATE = (
     "Inc. [AMD/ATI] Navi 21 [Radeon Pro V620 MxGPU] [1002:73ae]"
 )
 
-# The GPU_FLAGS filter ("VGA compatible controller", "3D controller")
-# is not strict enough to reject "Display controller", but
-# get_pci_devices() also filters by the vendor_id substring, so the
-# "1002" in the brackets makes these lines pass when vendor_id="1002".
-# However GPU_FLAGS still gates the line, so for the tests we rewrite
-# the controller token to one of the recognized strings.
-V620_PF_INFO = V620_PF_INFO.replace(
-    "Display controller [0380]", "VGA compatible controller [0300]"
-)
-V620_PF2_INFO = V620_PF2_INFO.replace(
-    "Display controller [0380]", "VGA compatible controller [0300]"
-)
-V620_VF_INFO_TEMPLATE = V620_VF_INFO_TEMPLATE.replace(
-    "Display controller [0380]", "VGA compatible controller [0300]"
-)
+# The lines above are used VERBATIM as captured (class 0380 "Display
+# controller"). The AMD driver scans with sysinfo._AMD_GPU_FLAGS, which
+# extends the shared GPU_FLAGS (VGA 0300 / 3D 0302) with "Display
+# controller" - gim-managed V620 PFs expose no VGA function and the
+# MxGPU VFs inherit the 0380 class. Earlier revisions of this file
+# rewrote the class token to "VGA compatible controller [0300]" to get
+# past the shared filter, which masked the discovery bug; every test
+# below is now also a regression test for the 0380 class gate.
 
 
 def _vf_line(func):
@@ -256,6 +249,44 @@ class TestAMDSysinfo(base.TestCase):
             invoke_on_load=False,
         )
         self.assertIs(AMDGPUDriver, mgr.driver)
+
+    # --- Test 7: legacy VGA class still discovered --------------------
+    @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
+                '.get_physfn')
+    @mock.patch('builtins.open')
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.lspci_privileged')
+    def test_vga_class_still_discovered(self, mock_lspci, mock_open,
+                                        mock_physfn):
+        # A hypothetical V620 enumerating as VGA 0300 (no gim, primary
+        # display function) must remain discoverable: _AMD_GPU_FLAGS
+        # extends GPU_FLAGS, it does not replace it.
+        vga_line = V620_PF_INFO.replace(
+            "Display controller [0380]", "VGA compatible controller [0300]"
+        )
+        mock_lspci.return_value = (vga_line + '\n', '')
+        mock_physfn.return_value = None
+        mock_open.side_effect = _SysfsMock({
+            '/sys/bus/pci/devices/0000:c1:00.0/sriov_numvfs': '0',
+            '/sys/bus/pci/devices/0000:c1:00.0/numa_node': '0',
+        })
+
+        devs = AMDGPUDriver().discover()
+
+        self.assertEqual(1, len(devs))
+        traits = _trait_values(_attribute_dict(devs[0]))
+        self.assertIn('CUSTOM_AMD_V620_PF', traits)
+
+    # --- Test 8: the extra class is scoped to the AMD driver ----------
+    def test_shared_gpu_flags_not_widened(self):
+        # The 0380 fix must not leak into the shared GPU_FLAGS used by
+        # NVIDIA discovery and discover_vendors().
+        from cyborg.accelerator.drivers.gpu import utils as gpu_utils
+
+        self.assertNotIn('Display controller', gpu_utils.GPU_FLAGS)
+        self.assertEqual(
+            gpu_utils.GPU_FLAGS + ['Display controller'],
+            sysinfo._AMD_GPU_FLAGS,
+        )
 
 
 class TestAMDSysinfoHelpers(base.TestCase):
