@@ -228,12 +228,28 @@ class TestSocketAndNumaResolution(base.TestCase):
     def test_read_numa_node_oserror_returns_none(self, _open):
         self.assertIsNone(sysinfo._read_numa_node('0000:31:00.0'))
 
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.get_sole_numa_node',
+                return_value=None)
     @mock.patch('builtins.open')
-    def test_read_numa_node_minus_one_returns_none(self, mock_open):
+    def test_read_numa_node_minus_one_returns_none(self, mock_open,
+                                                   mock_sole):
+        # Ambiguous host (zero or 2+ NUMA nodes): -1 stays unknown.
         mock_open.side_effect = _SysfsMock({
             '/sys/bus/pci/devices/0000:31:00.0/numa_node': '-1',
         })
         self.assertIsNone(sysinfo._read_numa_node('0000:31:00.0'))
+
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.get_sole_numa_node',
+                return_value=0)
+    @mock.patch('builtins.open')
+    def test_read_numa_node_minus_one_single_numa_fallback(self, mock_open,
+                                                           mock_sole):
+        # Single-NUMA host with firmware omitting _PXM: -1 -> node 0,
+        # so the RP gets CUSTOM_TOPO_NUMA0 instead of no NUMA trait.
+        mock_open.side_effect = _SysfsMock({
+            '/sys/bus/pci/devices/0000:31:00.0/numa_node': '-1',
+        })
+        self.assertEqual(0, sysinfo._read_numa_node('0000:31:00.0'))
 
     @mock.patch('builtins.open')
     def test_read_socket_id_delegates_to_gpu_utils(self, mock_open):

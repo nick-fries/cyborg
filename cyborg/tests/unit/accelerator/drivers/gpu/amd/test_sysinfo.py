@@ -189,12 +189,16 @@ class TestAMDSysinfo(base.TestCase):
         )
         self.assertEqual(['1', '2', '3', '4'], cpid_funcs)
 
-    # --- Test 3: NUMA -1 (no NUMA affinity) ---------------------------
+    # --- Test 3: NUMA -1 (no NUMA affinity, ambiguous host) -----------
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.get_sole_numa_node')
     @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
                 '.get_physfn')
     @mock.patch('builtins.open')
     @mock.patch('cyborg.accelerator.drivers.gpu.utils.lspci_privileged')
-    def test_numa_node_minus_one(self, mock_lspci, mock_open, mock_physfn):
+    def test_numa_node_minus_one(self, mock_lspci, mock_open, mock_physfn,
+                                 mock_sole):
+        # Host exposes zero or 2+ NUMA nodes: -1 must stay "unknown".
+        mock_sole.return_value = None
         mock_lspci.return_value = (V620_PF_INFO + '\n', '')
         mock_physfn.return_value = None
         mock_open.side_effect = _SysfsMock({
@@ -216,6 +220,35 @@ class TestAMDSysinfo(base.TestCase):
             )
         # Phase 2: numa_node attribute is "-1" when no NUMA affinity.
         self.assertEqual('-1', attrs['numa_node'])
+
+    # --- Test 3b: NUMA -1 on a single-NUMA host normalizes to node 0 --
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.get_sole_numa_node')
+    @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
+                '.get_physfn')
+    @mock.patch('builtins.open')
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.lspci_privileged')
+    def test_numa_node_minus_one_single_numa_host(self, mock_lspci,
+                                                  mock_open, mock_physfn,
+                                                  mock_sole):
+        # Single-socket firmware omitting ACPI _PXM: sysfs says -1 but
+        # exactly one /sys/devices/system/node/node<N> exists, so the
+        # deployable is normalized onto the sole node.
+        mock_sole.return_value = 0
+        mock_lspci.return_value = (V620_PF_INFO + '\n', '')
+        mock_physfn.return_value = None
+        mock_open.side_effect = _SysfsMock({
+            '/sys/bus/pci/devices/0000:c1:00.0/sriov_numvfs': '0',
+            '/sys/bus/pci/devices/0000:c1:00.0/numa_node': '-1',
+        })
+
+        devs = AMDGPUDriver().discover()
+
+        self.assertEqual(1, len(devs))
+        attrs = _attribute_dict(devs[0])
+        traits = _trait_values(attrs)
+        self.assertIn('CUSTOM_AMD_V620_NUMA0', traits)
+        self.assertNotIn('CUSTOM_AMD_V620_NUMA_NONE', traits)
+        self.assertEqual('0', attrs['numa_node'])
 
     # --- Test 4: NUMA OSError (sysfs read fails) ----------------------
     @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
@@ -294,8 +327,19 @@ class TestAMDSysinfoHelpers(base.TestCase):
 
     def test_read_numa_node_negative(self):
         m = mock.mock_open(read_data='-1\n')
-        with mock.patch('builtins.open', m):
+        with mock.patch('builtins.open', m), mock.patch(
+            'cyborg.accelerator.drivers.gpu.utils.get_sole_numa_node',
+            return_value=None,
+        ):
             self.assertIsNone(sysinfo._read_numa_node('0000:c1:00.0'))
+
+    def test_read_numa_node_negative_single_numa_fallback(self):
+        m = mock.mock_open(read_data='-1\n')
+        with mock.patch('builtins.open', m), mock.patch(
+            'cyborg.accelerator.drivers.gpu.utils.get_sole_numa_node',
+            return_value=0,
+        ):
+            self.assertEqual(0, sysinfo._read_numa_node('0000:c1:00.0'))
 
     def test_read_numa_node_oserror(self):
         with mock.patch(

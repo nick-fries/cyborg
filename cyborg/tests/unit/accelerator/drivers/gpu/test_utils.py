@@ -382,6 +382,44 @@ class TestIsVf(base.TestCase):
         )
 
 
+class TestGetSoleNumaNode(base.TestCase):
+    """Gated single-NUMA fallback used by the -1 numa_node normalization."""
+
+    @mock.patch('os.listdir', return_value=[
+        'node0', 'has_cpu', 'has_memory', 'online', 'possible',
+    ])
+    def test_exactly_one_node_returns_it(self, mock_listdir):
+        self.assertEqual(0, utils.get_sole_numa_node())
+        mock_listdir.assert_called_once_with('/sys/devices/system/node')
+
+    @mock.patch('os.listdir', return_value=['node3', 'online'])
+    def test_sole_nonzero_node_id_is_preserved(self, mock_listdir):
+        # If the only node is (unusually) not node0, return its real id
+        # rather than blindly normalizing to 0.
+        self.assertEqual(3, utils.get_sole_numa_node())
+
+    @mock.patch('os.listdir', return_value=[
+        'node0', 'node1', 'has_cpu', 'online',
+    ])
+    def test_multiple_nodes_return_none(self, mock_listdir):
+        self.assertIsNone(utils.get_sole_numa_node())
+
+    @mock.patch('os.listdir', return_value=['has_cpu', 'online'])
+    def test_zero_nodes_return_none(self, mock_listdir):
+        self.assertIsNone(utils.get_sole_numa_node())
+
+    @mock.patch('os.listdir', return_value=[
+        'node0', 'nodex', 'node', 'node01abc',
+    ])
+    def test_non_node_entries_are_ignored(self, mock_listdir):
+        self.assertEqual(0, utils.get_sole_numa_node())
+
+    @mock.patch('os.listdir', side_effect=OSError('no such dir'))
+    def test_listdir_oserror_returns_none(self, mock_listdir):
+        # Must not raise.
+        self.assertIsNone(utils.get_sole_numa_node())
+
+
 def multi_mock_open(*file_contents):
     """Create a mock "open" that will mock open multiple files in sequence.
 

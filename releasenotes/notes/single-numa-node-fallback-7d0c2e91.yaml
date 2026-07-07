@@ -1,0 +1,16 @@
+---
+features:
+  - |
+    PCI devices reporting ``numa_node = -1`` ("no NUMA affinity") are
+    now normalized to the host's sole NUMA node when exactly one
+    ``/sys/devices/system/node/node<N>`` exists. Single-socket
+    firmware routinely omits the ACPI ``_PXM`` method, leaving -1 on
+    every device even though the host trivially has one NUMA node;
+    previously such hosts surfaced socket traits
+    (``CUSTOM_AMD_V620_SOCKET0`` / ``CUSTOM_TOPO_SOCKET0``) but never
+    the corresponding NUMA traits. The fallback applies to both the
+    AMD V620 driver (``CUSTOM_AMD_V620_NUMA<n>`` trait, ``numa_node``
+    attribute and the per-NUMA sub-RP parenting) and the NIC topology
+    driver (``CUSTOM_TOPO_NUMA<n>``). Hosts with zero or multiple
+    NUMA nodes are unaffected: the -1 value remains "unknown" there,
+    so genuinely multi-NUMA topology reporting is unchanged.

@@ -88,8 +88,12 @@ def _read_numa_node(bdf):
     """Return the NUMA node id (int) for a PCI device, or None.
 
     Reads ``/sys/bus/pci/devices/<bdf>/numa_node``. A value of -1 in
-    sysfs (meaning "no NUMA affinity") is normalized to None. Any
-    OSError is caught and logged - this function never raises.
+    sysfs (meaning "no NUMA affinity") is normalized to the host's
+    sole NUMA node when exactly one
+    ``/sys/devices/system/node/node<N>`` exists (single-socket
+    firmware routinely omits ACPI ``_PXM``, leaving -1 on every
+    device), and to None otherwise. Any OSError is caught and logged
+    - this function never raises.
     """
     path = '/sys/bus/pci/devices/%s/numa_node' % bdf
     try:
@@ -110,7 +114,9 @@ def _read_numa_node(bdf):
         )
         return None
     if value < 0:
-        return None
+        # Gated single-NUMA fallback: unambiguous only when the host
+        # exposes exactly one NUMA node; otherwise stay "unknown".
+        return gpu_utils.get_sole_numa_node()
     return value
 
 

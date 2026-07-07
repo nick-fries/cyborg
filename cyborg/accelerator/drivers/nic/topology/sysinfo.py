@@ -161,7 +161,14 @@ def _read_numa_node(bdf):
     """Return the NUMA node id for a PCI device, or None.
 
     Mirrors the AMD driver's ``_read_numa_node`` but lives here so
-    the NIC topology driver doesn't import driver-specific code.
+    the NIC topology driver doesn't import driver-specific code
+    (the shared single-NUMA fallback lives in ``gpu_utils``, which
+    this driver already uses for socket resolution).
+
+    A sysfs value of -1 ("no NUMA affinity") is normalized to the
+    host's sole NUMA node when exactly one
+    ``/sys/devices/system/node/node<N>`` exists (single-socket
+    firmware routinely omits ACPI ``_PXM``), and to None otherwise.
     """
     path = os.path.join(_PCI_DEVICES_ROOT, bdf, 'numa_node')
     try:
@@ -174,7 +181,11 @@ def _read_numa_node(bdf):
         value = int(raw)
     except ValueError:
         return None
-    return value if value >= 0 else None
+    if value < 0:
+        # Gated single-NUMA fallback: unambiguous only when the host
+        # exposes exactly one NUMA node; otherwise stay "unknown".
+        return gpu_utils.get_sole_numa_node()
+    return value
 
 
 # ---------------------------------------------------------------------------

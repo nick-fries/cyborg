@@ -158,3 +158,40 @@ def get_socket_id(bdf):
         return int(raw)
     except ValueError:
         return None
+
+
+# Root of the kernel's NUMA topology view. Module-level so tests can
+# patch the listdir call without touching the real host.
+NUMA_NODE_ROOT = '/sys/devices/system/node'
+_NUMA_NODE_DIR_PATTERN = re.compile(r'^node(\d+)$')
+
+
+def get_sole_numa_node():
+    """Return the host's only NUMA node id, or None if not exactly one.
+
+    Single-socket firmware routinely omits the ACPI ``_PXM`` method,
+    in which case the kernel reports ``numa_node = -1`` ("no NUMA
+    affinity") for every PCI device even though the host trivially
+    has exactly one NUMA node. When ``/sys/devices/system/node``
+    exposes exactly one ``node<N>`` directory that mapping is
+    unambiguous, and callers may safely treat "no affinity" as the
+    sole node (returned as its integer id, normally 0).
+
+    With zero visible nodes (NUMA support absent) or two and more
+    nodes the ambiguity is real: return None so callers preserve
+    "NUMA unknown" semantics. Never raises.
+    """
+    try:
+        entries = os.listdir(NUMA_NODE_ROOT)
+    except OSError as e:
+        LOG.debug('Cannot list %s: %s; NUMA fallback unavailable.',
+                  NUMA_NODE_ROOT, e)
+        return None
+    nodes = []
+    for entry in entries:
+        m = _NUMA_NODE_DIR_PATTERN.match(entry)
+        if m:
+            nodes.append(int(m.group(1)))
+    if len(nodes) == 1:
+        return nodes[0]
+    return None
