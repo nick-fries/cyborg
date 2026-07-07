@@ -1,0 +1,13 @@
+---
+fixes:
+  - |
+    Fixed AMD Radeon Pro V620 discovery returning no devices. V620
+    functions managed by the ``gim`` kernel module enumerate with PCI
+    class 0380 ("Display controller"): the PF exposes no VGA function
+    and the MxGPU VFs inherit the class. The shared GPU class filter
+    only accepted "VGA compatible controller" (0300) and
+    "3D controller" (0302) and is applied before the vendor/product
+    match, so every V620 line was dropped. The AMD driver now scans
+    with an AMD-scoped class list that additionally accepts
+    "Display controller"; the shared filter (used by NVIDIA discovery)
+    is unchanged.

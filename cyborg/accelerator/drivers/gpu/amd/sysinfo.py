@@ -64,6 +64,16 @@ LOG = logging.getLogger(__name__)
 _DEFAULT_PF_PRODUCT_IDS = ["73a1"]
 _DEFAULT_VF_PRODUCT_IDS = ["73ae"]
 
+# PCI class strings the AMD lspci scan accepts. gim-managed V620
+# functions enumerate with PCI class 0380 ("Display controller"): the
+# PF exposes no VGA function and the MxGPU VFs inherit the class, so
+# the shared ``gpu_utils.GPU_FLAGS`` (VGA 0300 / 3D 0302) alone drops
+# every V620 line before the vendor/product match runs. The extra
+# class is deliberately scoped to this driver rather than added to
+# ``GPU_FLAGS`` itself so NVIDIA discovery and ``discover_vendors()``
+# are not widened.
+_AMD_GPU_FLAGS = gpu_utils.GPU_FLAGS + ["Display controller"]
+
 # Trait constants. ``CUSTOM_AMD_V620`` is emitted on every V620
 # deployable (PF or VF); the *_PF / *_VF / *_MXGPU traits differentiate.
 _TRAIT_OWNER_CYBORG = "OWNER_CYBORG"
@@ -361,8 +371,9 @@ def _discover_v620(vendor_id):
         )
     )
 
-    # 1. lspci-driven raw discovery, filtered to vendor 1002.
-    raw_lines = gpu_utils.get_pci_devices(gpu_utils.GPU_FLAGS, vendor_id)
+    # 1. lspci-driven raw discovery, filtered to vendor 1002. Uses the
+    #    AMD-scoped class list so class 0380 V620 functions are seen.
+    raw_lines = gpu_utils.get_pci_devices(_AMD_GPU_FLAGS, vendor_id)
 
     # 2. Parse and bucket into PF / VF dicts by product ID.
     pfs = {}  # pf_bdf -> gpu_dict
