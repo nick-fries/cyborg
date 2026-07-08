@@ -294,6 +294,62 @@ class TestAMDSysinfo(base.TestCase):
 
         self.assertEqual([], devs)
 
+    # --- Test 2g: gim-bound PF is NEVER passthrough, even numvfs=0 ----
+    @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo'
+                '._read_pf_driver')
+    @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
+                '.get_physfn')
+    @mock.patch('builtins.open')
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.lspci_privileged')
+    def test_gim_pf_numvfs_zero_never_passthrough(self, mock_lspci,
+                                                  mock_open, mock_physfn,
+                                                  mock_driver):
+        # gim owns the PF but sriov_numvfs reads 0 (init/teardown
+        # window). The PF must NOT fall back to passthrough mode; with
+        # no VFs visible the card is skipped outright.
+        mock_lspci.return_value = (V620_PF_INFO + '\n', '')
+        mock_physfn.return_value = None
+        mock_driver.return_value = 'gim'
+        mock_open.side_effect = _SysfsMock({
+            '/sys/bus/pci/devices/0000:c1:00.0/sriov_numvfs': '0',
+            '/sys/bus/pci/devices/0000:c1:00.0/numa_node': '0',
+        })
+
+        devs = AMDGPUDriver().discover()
+
+        self.assertEqual([], devs)
+
+    # --- Test 2h: gim-bound PF, numvfs=0 but VFs visible -> VF mode ---
+    @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo'
+                '._read_pf_driver')
+    @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
+                '.get_physfn')
+    @mock.patch('builtins.open')
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.lspci_privileged')
+    def test_gim_pf_numvfs_zero_with_vfs_uses_vf_mode(self, mock_lspci,
+                                                      mock_open,
+                                                      mock_physfn,
+                                                      mock_driver):
+        # Stale numvfs=0 while lspci still shows VFs: discovered truth
+        # wins - the card is a sliced deployable, never passthrough.
+        lines = '\n'.join([V620_PF_INFO, _vf_line(1), _vf_line(2)]) + '\n'
+        mock_lspci.return_value = (lines, '')
+        mock_physfn.return_value = '0000:c1:00.0'
+        mock_driver.return_value = 'gim'
+        mock_open.side_effect = _SysfsMock({
+            '/sys/bus/pci/devices/0000:c1:00.0/sriov_numvfs': '0',
+            '/sys/bus/pci/devices/0000:c1:00.0/numa_node': '0',
+        })
+
+        devs = AMDGPUDriver().discover()
+
+        self.assertEqual(1, len(devs))
+        dep = devs[0].deployable_list[0]
+        self.assertEqual(2, dep.num_accelerators)
+        traits = _trait_values(_attribute_dict(devs[0]))
+        self.assertIn('CUSTOM_AMD_V620_VF', traits)
+        self.assertNotIn('CUSTOM_AMD_V620_PF', traits)
+
     # --- Test 2e: orphan VFs with readable physfn group into a card ---
     @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
                 '.get_physfn')
@@ -562,6 +618,21 @@ class TestAMDSysinfoHelpers(base.TestCase):
             'builtins.open', side_effect=OSError('no such file'),
         ):
             self.assertEqual(0, sysinfo._read_sriov_numvfs('0000:c1:00.0'))
+
+    def test_read_pf_driver(self):
+        with mock.patch(
+            'os.readlink',
+            return_value='../../../../bus/pci/drivers/gim',
+        ):
+            self.assertEqual(
+                'gim', sysinfo._read_pf_driver('0000:c1:00.0'),
+            )
+
+    def test_read_pf_driver_unbound(self):
+        with mock.patch(
+            'os.readlink', side_effect=OSError('no such file'),
+        ):
+            self.assertIsNone(sysinfo._read_pf_driver('0000:c1:00.0'))
 
 
     def test_read_socket_id_happy_path(self):

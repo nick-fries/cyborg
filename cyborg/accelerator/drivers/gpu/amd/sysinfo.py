@@ -25,11 +25,12 @@ The physical card (PF) is always the DriverDevice; discovery mode
 decides the deployable's capacity, mirroring the NVIDIA driver's
 PGPU/vGPU split:
 
-* ``sriov_numvfs == 0`` (gim not loaded): PF passthrough mode. One
-  deployable, ``num_accelerators = 1``, one AH_TYPE_PCI attach handle
-  = the PF itself.
-* ``sriov_numvfs > 0`` (MxGPU sliced): one deployable *per card*,
-  ``num_accelerators = <discovered VF count>``, one AH_TYPE_PCI
+* PF not bound to gim and ``sriov_numvfs == 0``: PF passthrough mode.
+  One deployable, ``num_accelerators = 1``, one AH_TYPE_PCI attach
+  handle = the PF itself. A PF bound to gim is NEVER offered for
+  passthrough, even if sriov_numvfs momentarily reads 0.
+* gim-bound PF or ``sriov_numvfs > 0`` (MxGPU sliced): one deployable
+  *per card*, ``num_accelerators = <discovered VF count>``, one AH_TYPE_PCI
   attach handle per VF (sorted by BDF, so handle allocation order is
   deterministic). The card keeps a single Placement RP whose
   inventory is the VF count; VF lineage is structural (handles hang
@@ -48,6 +49,7 @@ NUMA awareness is surfaced two ways:
   ``_get_or_create_numa_subprovider``.
 """
 
+import os
 import re
 
 from oslo_log import log as logging
@@ -130,6 +132,14 @@ _PRODUCT_NAME_MAP = {
     "73a1": "Radeon PRO V620",
     "73ae": "Radeon PRO V620 MxGPU VF",
 }
+
+# Host drivers that own the PF for virtualization. A PF bound to one of
+# these must NEVER be emitted as a passthrough deployable, regardless of
+# what sriov_numvfs reads at scan time (gim briefly reports 0 during
+# init/teardown, and a passthrough bind would hand the vendor host
+# driver's device to a guest). Mode selection checks this before
+# sriov_numvfs.
+_PF_NEVER_PASSTHROUGH_DRIVERS = ("gim",)
 
 
 def _read_numa_node(bdf):
@@ -215,6 +225,23 @@ def _read_sriov_numvfs(bdf):
             'Unexpected sriov_numvfs content for %s: %r', bdf, raw,
         )
         return 0
+
+
+def _read_pf_driver(bdf):
+    """Return the kernel driver bound to a PCI function, or None.
+
+    Resolves the ``/sys/bus/pci/devices/<bdf>/driver`` symlink. An
+    unbound device (no symlink) or any read error returns None -
+    callers must treat None as "driver unknown".
+    """
+    path = '/sys/bus/pci/devices/%s/driver' % bdf
+    try:
+        return os.path.basename(os.readlink(path))
+    except OSError as e:
+        LOG.debug(
+            'No bound driver readable for %s at %s (%s).', bdf, path, e,
+        )
+        return None
 
 
 def _sanitize_trait_suffix(text):
@@ -456,10 +483,13 @@ def _discover_v620(vendor_id):
     """Discover V620 cards on the local host.
 
     Returns a list of DriverDevice objects, one per physical card
-    (PF). A PF with sriov_numvfs==0 is a passthrough deployable
-    (num_accelerators=1, handle = PF); a PF with sriov_numvfs>0 is a
-    sliced deployable (num_accelerators = discovered VF count, one
-    handle per VF, sorted by BDF).
+    (PF). A PF that is NOT bound to a virtualization host driver
+    (gim) and has sriov_numvfs==0 is a passthrough deployable
+    (num_accelerators=1, handle = PF). A gim-bound PF or one with
+    sriov_numvfs>0 is a sliced deployable (num_accelerators =
+    discovered VF count, one handle per VF, sorted by BDF); if no VFs
+    are visible the card is skipped entirely - a gim-owned PF is
+    never offered for passthrough.
     """
     pf_product_ids = set(
         _config_product_ids(
@@ -507,13 +537,18 @@ def _discover_v620(vendor_id):
 
     devices = []
 
-    # 4a. One DriverDevice per known PF; sriov_numvfs picks the mode.
+    # 4a. One DriverDevice per known PF. The bound driver is checked
+    #     first: a PF owned by a virtualization host driver (gim) is
+    #     never passthrough-eligible, whatever sriov_numvfs says.
+    #     Otherwise sriov_numvfs picks the mode.
     handled_vfs = set()
     for pf_bdf, pf_info in pfs.items():
         numvfs = _read_sriov_numvfs(pf_bdf)
+        pf_driver = _read_pf_driver(pf_bdf)
+        never_passthrough = pf_driver in _PF_NEVER_PASSTHROUGH_DRIVERS
         pf_info["rc"] = constants.RESOURCES["PGPU"]
         pf_info["model_name"] = _resolve_model_name(pf_info)
-        if numvfs <= 0:
+        if numvfs <= 0 and not never_passthrough:
             # PF passthrough mode - one handle, the PF itself.
             pf_info.update(_get_traits_and_numa(
                 pf_bdf, role="PF",
@@ -528,11 +563,11 @@ def _discover_v620(vendor_id):
             vf_bdfs = sorted(vfs_by_pf.get(pf_bdf, []))
             if not vf_bdfs:
                 LOG.warning(
-                    'PF %s reports sriov_numvfs=%d but no enabled VFs '
-                    'were discovered via lspci; skipping the card '
-                    '(no allocatable capacity, and the gim-owned PF '
-                    'must not be offered for passthrough).',
-                    pf_bdf, numvfs,
+                    'PF %s (driver=%s, sriov_numvfs=%d) has no enabled '
+                    'VFs discovered via lspci; skipping the card. A PF '
+                    'owned by a virtualization host driver is never '
+                    'offered for passthrough.',
+                    pf_bdf, pf_driver, numvfs,
                 )
                 continue
             if len(vf_bdfs) != numvfs:
