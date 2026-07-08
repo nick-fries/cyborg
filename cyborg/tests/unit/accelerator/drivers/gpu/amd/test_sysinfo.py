@@ -119,6 +119,17 @@ class TestAMDSysinfo(base.TestCase):
         self.assertIn('CUSTOM_AMD_V620_NUMA0', traits)
         self.assertNotIn('CUSTOM_AMD_V620_VF', traits)
         self.assertNotIn('CUSTOM_AMD_MXGPU', traits)
+        # vendor:device scheduling traits (PF product + model name).
+        self.assertIn('CUSTOM_GPU_1002_73A1', traits)
+        self.assertIn('CUSTOM_GPU_MODEL_RADEON_PRO_V620', traits)
+        self.assertNotIn('CUSTOM_GPU_1002_73AE', traits)
+        # Normalization: model from the product-name map, and
+        # vendor_board_info reduced to the unmodeled-only bucket.
+        self.assertEqual('Radeon PRO V620', devs[0].model)
+        self.assertEqual(
+            {'other': {}}, jsonutils.loads(devs[0].vendor_board_info)
+        )
+        self.assertEqual(1, devs[0].deployable_list[0].num_accelerators)
         # Phase 2: generic numa_node DriverAttribute is emitted alongside
         # the CUSTOM_AMD_V620_NUMA<n> trait for the conductor sub-RP layer.
         self.assertEqual('0', attrs['numa_node'])
@@ -132,12 +143,16 @@ class TestAMDSysinfo(base.TestCase):
         self.assertEqual('c1', cpid['bus'])
         self.assertEqual('0', cpid['function'])
 
-    # --- Test 2: VF-only discovery ------------------------------------
+    # --- Test 2: VF mode = one PF-level deployable --------------------
+    # DESIGN-cyborg-v620-pf-deployable-model.md §6: one DriverDevice
+    # per card, cpid = PF BDF, num_accelerators = VF count, one
+    # AH_TYPE_PCI handle per VF sorted by BDF.
     @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
                 '.get_physfn')
     @mock.patch('builtins.open')
     @mock.patch('cyborg.accelerator.drivers.gpu.utils.lspci_privileged')
-    def test_vf_only_discovery(self, mock_lspci, mock_open, mock_physfn):
+    def test_vf_mode_pf_level_deployable(self, mock_lspci, mock_open,
+                                         mock_physfn):
         lines = '\n'.join(
             [V620_PF_INFO] + [_vf_line(i) for i in range(1, 5)]
         ) + '\n'
@@ -146,41 +161,199 @@ class TestAMDSysinfo(base.TestCase):
         # Every VF's parent is the PF.
         mock_physfn.return_value = '0000:c1:00.0'
 
-        sysfs = {
+        # Locality is read from the PF (VFs inherit it structurally).
+        mock_open.side_effect = _SysfsMock({
             '/sys/bus/pci/devices/0000:c1:00.0/sriov_numvfs': '4',
-        }
-        for i in range(1, 5):
-            sysfs['/sys/bus/pci/devices/0000:c1:00.%d/numa_node' % i] = '0'
-        mock_open.side_effect = _SysfsMock(sysfs)
+            '/sys/bus/pci/devices/0000:c1:00.0/numa_node': '0',
+        })
 
         devs = AMDGPUDriver().discover()
 
-        self.assertEqual(4, len(devs))
-        for dev in devs:
-            attrs = _attribute_dict(dev)
-            traits = _trait_values(attrs)
-            self.assertEqual('PGPU', attrs['rc'])
-            self.assertIn('OWNER_CYBORG', traits)
-            self.assertIn('CUSTOM_AMD_V620', traits)
-            self.assertIn('CUSTOM_AMD_V620_VF', traits)
-            self.assertIn('CUSTOM_AMD_MXGPU', traits)
-            self.assertIn('CUSTOM_AMD_V620_NUMA0', traits)
-            self.assertNotIn('CUSTOM_AMD_V620_PF', traits)
-            # Phase 2: VF deployables also carry the generic numa_node
-            # attribute for conductor consumption.
-            self.assertEqual('0', attrs['numa_node'])
-            cpid = jsonutils.loads(dev.controlpath_id.cpid_info)
-            # Each VF must use its own BDF as the cpid (a distinct RP).
-            self.assertEqual('c1', cpid['bus'])
-            self.assertEqual('00', cpid['device'])
-            self.assertNotEqual('0', cpid['function'])
+        self.assertEqual(1, len(devs))
+        dev = devs[0]
 
-        # No PF DriverDevice was emitted (cpids only function 1..4).
-        cpid_funcs = sorted(
+        # Device row is the card: cpid = PF BDF.
+        cpid = jsonutils.loads(dev.controlpath_id.cpid_info)
+        self.assertEqual('c1', cpid['bus'])
+        self.assertEqual('00', cpid['device'])
+        self.assertEqual('0', cpid['function'])
+        self.assertEqual('Radeon PRO V620', dev.model)
+        self.assertEqual(
+            '73a1', jsonutils.loads(dev.std_board_info)['product_id']
+        )
+        # parent_pf breadcrumb is gone; only the unmodeled bucket stays.
+        self.assertEqual(
+            {'other': {}}, jsonutils.loads(dev.vendor_board_info)
+        )
+
+        dep = dev.deployable_list[0]
+        self.assertEqual('compute-amd-01_0000:c1:00.0', dep.name)
+        self.assertEqual(4, dep.num_accelerators)
+
+        # One handle per VF, sorted by BDF (lowest-first determinism).
+        funcs = []
+        for ah in dep.attach_handle_list:
+            self.assertFalse(ah.in_use)
+            info = jsonutils.loads(ah.attach_info)
+            self.assertEqual(
+                ['bus', 'device', 'domain', 'function'],
+                sorted(info.keys()),
+            )
+            funcs.append(info['function'])
+        self.assertEqual(['1', '2', '3', '4'], funcs)
+
+        attrs = _attribute_dict(dev)
+        traits = _trait_values(attrs)
+        self.assertEqual('PGPU', attrs['rc'])
+        self.assertIn('OWNER_CYBORG', traits)
+        self.assertIn('CUSTOM_AMD_V620', traits)
+        self.assertIn('CUSTOM_AMD_V620_VF', traits)
+        self.assertIn('CUSTOM_AMD_MXGPU', traits)
+        self.assertNotIn('CUSTOM_AMD_V620_PF', traits)
+        # vendor:device traits: card product AND VF product + model.
+        self.assertIn('CUSTOM_GPU_1002_73A1', traits)
+        self.assertIn('CUSTOM_GPU_1002_73AE', traits)
+        self.assertIn('CUSTOM_GPU_MODEL_RADEON_PRO_V620', traits)
+        # Locality comes from the PF BDF.
+        self.assertIn('CUSTOM_AMD_V620_NUMA0', traits)
+        self.assertEqual('0', attrs['numa_node'])
+
+    # --- Test 2b: handle order is BDF order regardless of lspci order -
+    @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
+                '.get_physfn')
+    @mock.patch('builtins.open')
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.lspci_privileged')
+    def test_vf_handles_sorted_by_bdf(self, mock_lspci, mock_open,
+                                      mock_physfn):
+        # lspci emits the VFs shuffled; handles must still come out
+        # ascending so handle-row id order == function order.
+        lines = '\n'.join(
+            [V620_PF_INFO, _vf_line(4), _vf_line(2), _vf_line(3),
+             _vf_line(1)]
+        ) + '\n'
+        mock_lspci.return_value = (lines, '')
+        mock_physfn.return_value = '0000:c1:00.0'
+        mock_open.side_effect = _SysfsMock({
+            '/sys/bus/pci/devices/0000:c1:00.0/sriov_numvfs': '4',
+            '/sys/bus/pci/devices/0000:c1:00.0/numa_node': '0',
+        })
+
+        devs = AMDGPUDriver().discover()
+
+        self.assertEqual(1, len(devs))
+        funcs = [
+            jsonutils.loads(ah.attach_info)['function']
+            for ah in devs[0].deployable_list[0].attach_handle_list
+        ]
+        self.assertEqual(['1', '2', '3', '4'], funcs)
+
+    # --- Test 2c: sriov_numvfs vs discovered-VF mismatch --------------
+    @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
+                '.get_physfn')
+    @mock.patch('builtins.open')
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.lspci_privileged')
+    def test_vf_count_is_discovered_not_declared(self, mock_lspci,
+                                                 mock_open, mock_physfn):
+        # sriov_numvfs says 4 but only 2 VFs are visible: report the
+        # discovered capacity (never fake handles).
+        lines = '\n'.join(
+            [V620_PF_INFO, _vf_line(1), _vf_line(2)]
+        ) + '\n'
+        mock_lspci.return_value = (lines, '')
+        mock_physfn.return_value = '0000:c1:00.0'
+        mock_open.side_effect = _SysfsMock({
+            '/sys/bus/pci/devices/0000:c1:00.0/sriov_numvfs': '4',
+            '/sys/bus/pci/devices/0000:c1:00.0/numa_node': '0',
+        })
+
+        devs = AMDGPUDriver().discover()
+
+        self.assertEqual(1, len(devs))
+        dep = devs[0].deployable_list[0]
+        self.assertEqual(2, dep.num_accelerators)
+        self.assertEqual(2, len(dep.attach_handle_list))
+
+    # --- Test 2d: numvfs>0 but zero VFs visible -> card skipped -------
+    @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
+                '.get_physfn')
+    @mock.patch('builtins.open')
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.lspci_privileged')
+    def test_vf_mode_no_vfs_skips_card(self, mock_lspci, mock_open,
+                                       mock_physfn):
+        # gim owns the PF (numvfs>0) but no VF made it through the
+        # product filter: the card has no allocatable capacity and the
+        # gim-owned PF must not be offered for passthrough.
+        mock_lspci.return_value = (V620_PF_INFO + '\n', '')
+        mock_physfn.return_value = None
+        mock_open.side_effect = _SysfsMock({
+            '/sys/bus/pci/devices/0000:c1:00.0/sriov_numvfs': '2',
+            '/sys/bus/pci/devices/0000:c1:00.0/numa_node': '0',
+        })
+
+        devs = AMDGPUDriver().discover()
+
+        self.assertEqual([], devs)
+
+    # --- Test 2e: orphan VFs with readable physfn group into a card ---
+    @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
+                '.get_physfn')
+    @mock.patch('builtins.open')
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.lspci_privileged')
+    def test_orphan_vfs_grouped_by_physfn(self, mock_lspci, mock_open,
+                                          mock_physfn):
+        # The PF is hidden from lspci (filtered product ID / foreign
+        # driver) but sysfs physfn still names it: synthesize the
+        # PF-keyed card device instead of per-VF devices.
+        lines = '\n'.join([_vf_line(1), _vf_line(2)]) + '\n'
+        mock_lspci.return_value = (lines, '')
+        mock_physfn.return_value = '0000:c1:00.0'
+        mock_open.side_effect = _SysfsMock({
+            '/sys/bus/pci/devices/0000:c1:00.0/numa_node': '0',
+        })
+
+        devs = AMDGPUDriver().discover()
+
+        self.assertEqual(1, len(devs))
+        dev = devs[0]
+        cpid = jsonutils.loads(dev.controlpath_id.cpid_info)
+        self.assertEqual('0', cpid['function'])
+        dep = dev.deployable_list[0]
+        self.assertEqual('compute-amd-01_0000:c1:00.0', dep.name)
+        self.assertEqual(2, dep.num_accelerators)
+        traits = _trait_values(_attribute_dict(dev))
+        # PF product unknown here - only the VF product trait.
+        self.assertIn('CUSTOM_GPU_1002_73AE', traits)
+        self.assertNotIn('CUSTOM_GPU_1002_73A1', traits)
+        # Degraded-but-honest model from the VF product map.
+        self.assertEqual('Radeon PRO V620 MxGPU VF', dev.model)
+
+    # --- Test 2f: orphan VFs with unreadable physfn -> legacy per-VF --
+    @mock.patch('cyborg.accelerator.drivers.gpu.amd.sysinfo.gpu_utils'
+                '.get_physfn')
+    @mock.patch('builtins.open')
+    @mock.patch('cyborg.accelerator.drivers.gpu.utils.lspci_privileged')
+    def test_orphan_vfs_no_physfn_legacy_per_vf(self, mock_lspci,
+                                                mock_open, mock_physfn):
+        lines = '\n'.join([_vf_line(1), _vf_line(2)]) + '\n'
+        mock_lspci.return_value = (lines, '')
+        mock_physfn.return_value = None
+        mock_open.side_effect = _SysfsMock({
+            '/sys/bus/pci/devices/0000:c1:00.1/numa_node': '0',
+            '/sys/bus/pci/devices/0000:c1:00.2/numa_node': '0',
+        })
+
+        devs = AMDGPUDriver().discover()
+
+        self.assertEqual(2, len(devs))
+        funcs = sorted(
             jsonutils.loads(d.controlpath_id.cpid_info)['function']
             for d in devs
         )
-        self.assertEqual(['1', '2', '3', '4'], cpid_funcs)
+        self.assertEqual(['1', '2'], funcs)
+        for dev in devs:
+            self.assertEqual(
+                1, dev.deployable_list[0].num_accelerators
+            )
 
     # --- Test 3: NUMA -1 (no NUMA affinity, ambiguous host) -----------
     @mock.patch('cyborg.accelerator.drivers.gpu.utils.get_sole_numa_node')
@@ -432,3 +605,39 @@ class TestAMDSysinfoHelpers(base.TestCase):
             'builtins.open', side_effect=OSError('boom'),
         ):
             self.assertIsNone(sysinfo._read_socket_id('0000:c1:00.0'))
+
+    def test_sanitize_trait_suffix(self):
+        self.assertEqual(
+            'RADEON_PRO_V620',
+            sysinfo._sanitize_trait_suffix('Radeon PRO V620'),
+        )
+        self.assertEqual(
+            'A_B_C', sysinfo._sanitize_trait_suffix('a-b(c)'),
+        )
+        self.assertIsNone(sysinfo._sanitize_trait_suffix(''))
+        self.assertIsNone(sysinfo._sanitize_trait_suffix('***'))
+        self.assertIsNone(sysinfo._sanitize_trait_suffix(None))
+
+    def test_resolve_model_name_map_hit(self):
+        self.assertEqual(
+            'Radeon PRO V620',
+            sysinfo._resolve_model_name(
+                {'product_id': '73A1', 'model': 'whatever lspci said'}
+            ),
+        )
+
+    def test_resolve_model_name_fallback_to_lspci(self):
+        with mock.patch.dict(sysinfo._PRODUCT_NAME_MAP, clear=True):
+            self.assertEqual(
+                'Navi 21 GL-XL',
+                sysinfo._resolve_model_name(
+                    {'product_id': '73a1', 'model': 'Navi 21 GL-XL'}
+                ),
+            )
+
+    def test_resolve_model_name_unknown(self):
+        with mock.patch.dict(sysinfo._PRODUCT_NAME_MAP, clear=True):
+            self.assertEqual(
+                'unknown',
+                sysinfo._resolve_model_name({'product_id': '9999'}),
+            )
