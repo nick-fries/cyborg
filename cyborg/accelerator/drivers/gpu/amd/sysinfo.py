@@ -17,14 +17,24 @@
 Cyborg AMD GPU driver implementation - V620 discovery.
 
 Architecture B (Cyborg owns inventory and scheduling) - see
-PLAN-amd-v620.md sections 1, 2, 4, 7.
+PLAN-amd-v620.md sections 1, 2, 4, 7, and
+DESIGN-cyborg-v620-pf-deployable-model.md (repo root) for the
+PF-level deployable model implemented here.
 
-PF and VF representation are mutually exclusive at the source:
+The physical card (PF) is always the DriverDevice; discovery mode
+decides the deployable's capacity, mirroring the NVIDIA driver's
+PGPU/vGPU split:
 
-* If a PF has ``sriov_numvfs == 0`` (gim not loaded) the PF is emitted
-  as a single ``DriverDevice``; no VFs exist.
-* If a PF has ``sriov_numvfs > 0`` one ``DriverDevice`` is emitted per
-  VF; the PF itself is skipped.
+* ``sriov_numvfs == 0`` (gim not loaded): PF passthrough mode. One
+  deployable, ``num_accelerators = 1``, one AH_TYPE_PCI attach handle
+  = the PF itself.
+* ``sriov_numvfs > 0`` (MxGPU sliced): one deployable *per card*,
+  ``num_accelerators = <discovered VF count>``, one AH_TYPE_PCI
+  attach handle per VF (sorted by BDF, so handle allocation order is
+  deterministic). The card keeps a single Placement RP whose
+  inventory is the VF count; VF lineage is structural (handles hang
+  off the PF deployable) instead of data (the old ``parent_pf`` JSON
+  breadcrumb in ``vendor_board_info``).
 
 NUMA awareness is surfaced two ways:
 
@@ -38,7 +48,7 @@ NUMA awareness is surfaced two ways:
   ``_get_or_create_numa_subprovider``.
 """
 
-import os
+import re
 
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
@@ -92,6 +102,34 @@ _TRAIT_NUMA_PREFIX = "CUSTOM_AMD_V620_NUMA"
 # ``<host>_socket_<n>`` sub-RP above the NUMA sub-RP.
 _TRAIT_SOCKET_NONE = "CUSTOM_AMD_V620_SOCKET_NONE"
 _TRAIT_SOCKET_PREFIX = "CUSTOM_AMD_V620_SOCKET"
+
+# vendor:device scheduling traits (DESIGN §"vendor:device"). Emitted on
+# every deployable so a device profile can pin a card type in a mixed
+# fleet without inventing per-model trait names by hand:
+#
+# * ``CUSTOM_GPU_<vendor>_<product>`` - one per product ID visible on
+#   the deployable. PF passthrough mode carries the PF product
+#   (CUSTOM_GPU_1002_73A1); VF mode carries the card's PF product AND
+#   the VF product (CUSTOM_GPU_1002_73AE), so "any V620 card" and
+#   "an MxGPU VF specifically" are both expressible.
+# * ``CUSTOM_GPU_MODEL_<sanitized model>`` - the human model name
+#   (e.g. CUSTOM_GPU_MODEL_RADEON_PRO_V620), for operators who think
+#   in model strings rather than PCI IDs.
+#
+# Mode pinning (whole card vs slice) stays on the existing
+# CUSTOM_AMD_V620_PF / _VF traits - the product traits select the
+# silicon, not the carve-up.
+_TRAIT_GPU_PRODUCT_FMT = "CUSTOM_GPU_%s_%s"
+_TRAIT_GPU_MODEL_PREFIX = "CUSTOM_GPU_MODEL_"
+
+# Product-ID -> canonical model name. lspci's text depends on the
+# container image's pci.ids vintage (the deployed agent image renders
+# Navi 21 GL-XL as "unknown"); this map makes ``model`` deterministic.
+# Falls back to the lspci-captured text for unmapped IDs.
+_PRODUCT_NAME_MAP = {
+    "73a1": "Radeon PRO V620",
+    "73ae": "Radeon PRO V620 MxGPU VF",
+}
 
 
 def _read_numa_node(bdf):
@@ -179,12 +217,47 @@ def _read_sriov_numvfs(bdf):
         return 0
 
 
-def _get_traits_and_numa(bdf, role):
+def _sanitize_trait_suffix(text):
+    """Turn free text into a Placement-legal trait suffix.
+
+    Placement custom traits must match ``CUSTOM_[A-Z0-9_]+``. Uppercase
+    the text and collapse every run of other characters into a single
+    underscore: ``"Radeon PRO V620"`` -> ``"RADEON_PRO_V620"``.
+    Returns ``None`` if nothing legal survives.
+    """
+    if not text:
+        return None
+    out = re.sub(r'[^A-Za-z0-9]+', '_', text).strip('_').upper()
+    return out or None
+
+
+def _resolve_model_name(info):
+    """Canonical model name for a parsed lspci dict.
+
+    Product-ID map first (deterministic, image-independent), then the
+    lspci-captured model text, then ``"unknown"``.
+    """
+    product_id = (info.get('product_id') or '').lower()
+    mapped = _PRODUCT_NAME_MAP.get(product_id)
+    if mapped:
+        return mapped
+    captured = (info.get('model') or '').strip()
+    return captured or 'unknown'
+
+
+def _get_traits_and_numa(bdf, role, product_ids=(), model_name=None):
     """Build the trait list AND raw numa_node + socket_id for a V620 deployable.
 
     :param bdf: PCI BDF of the deployable's device (used to read
-                NUMA + socket).
+                NUMA + socket). In VF mode this is the *PF's* BDF -
+                all VFs share the card's locality by construction.
     :param role: ``"PF"`` or ``"VF"``.
+    :param product_ids: iterable of PCI product IDs to expose as
+                        ``CUSTOM_GPU_<vendor>_<product>`` traits
+                        (vendor fixed to 1002 for this driver).
+    :param model_name: canonical model name to expose as a
+                       ``CUSTOM_GPU_MODEL_<...>`` trait; skipped when
+                       None/unknown.
     :returns: dict with ``"traits"`` (list[str]), ``"numa_node"``
               (``str(int)``; ``"-1"`` for no NUMA affinity), and
               ``"socket_id"`` (``str(int)``; ``"-1"`` if unreadable).
@@ -206,6 +279,16 @@ def _get_traits_and_numa(bdf, role):
     elif role == "VF":
         traits.append(_TRAIT_AMD_V620_VF)
         traits.append(_TRAIT_AMD_MXGPU)
+
+    # vendor:device scheduling traits.
+    for pid in product_ids:
+        suffix = _sanitize_trait_suffix(pid)
+        if suffix:
+            traits.append(_TRAIT_GPU_PRODUCT_FMT % ("1002", suffix))
+    if model_name and model_name != 'unknown':
+        suffix = _sanitize_trait_suffix(model_name)
+        if suffix:
+            traits.append(_TRAIT_GPU_MODEL_PREFIX + suffix)
 
     numa_node = _read_numa_node(bdf)
     if numa_node is None:
@@ -279,38 +362,53 @@ def _generate_attribute_list(gpu):
     return attr_list
 
 
-def _generate_attach_handle(gpu):
-    """Build a single AH_TYPE_PCI attach handle for a V620 deployable."""
+def _generate_attach_handle(bdf):
+    """Build one AH_TYPE_PCI attach handle for the given PCI BDF.
+
+    ``attach_info`` is exactly ``{domain, bus, device, function}`` -
+    nova's hostdev generation parses it; no extra keys.
+    """
     driver_ah = driver_attach_handle.DriverAttachHandle()
     driver_ah.in_use = False
     driver_ah.attach_type = constants.AH_TYPE_PCI
-    driver_ah.attach_info = utils.pci_str_to_json(gpu["devices"])
+    driver_ah.attach_info = utils.pci_str_to_json(bdf)
     return driver_ah
 
 
 def _generate_dep_list(gpu):
-    """Build the (single-element) DriverDeployable list for a V620 device.
+    """Build the (single-element) DriverDeployable list for a V620 card.
 
-    AMD V620 is straight PCI passthrough - one deployable, one attach
-    handle, no mdev-like multiplexing.
+    One deployable per card, named after the device's own BDF (the
+    PF). ``gpu["attach_bdfs"]``, when present, lists the allocatable
+    functions (the VFs in MxGPU mode); otherwise the device's own BDF
+    is the sole handle (PF passthrough). ``num_accelerators`` is the
+    handle count, so the deployable's Placement inventory equals its
+    real capacity (total = max_unit = N).
+
+    Handles are created sorted by BDF. lspci -D prints fixed-width
+    lowercase hex, so lexicographic order == numeric order; combined
+    with the allocator's ``ORDER BY id`` this yields
+    lowest-free-function-first allocation, deterministically.
     """
     driver_dep = driver_deployable.DriverDeployable()
     driver_dep.attribute_list = _generate_attribute_list(gpu)
-    driver_dep.attach_handle_list = [_generate_attach_handle(gpu)]
+    attach_bdfs = gpu.get("attach_bdfs") or [gpu["devices"]]
+    driver_dep.attach_handle_list = [
+        _generate_attach_handle(bdf) for bdf in sorted(attach_bdfs)
+    ]
     driver_dep.name = gpu.get('hostname', '') + '_' + gpu["devices"]
     driver_dep.driver_name = gpu_utils.VENDOR_MAPS.get(
         gpu["vendor_id"], ''
     ).upper()
-    driver_dep.num_accelerators = 1
+    driver_dep.num_accelerators = len(driver_dep.attach_handle_list)
     return [driver_dep]
 
 
 def _generate_controlpath_id(gpu):
-    """Build the DriverControlPathID for a V620 device.
+    """Build the DriverControlPathID for a V620 card.
 
-    The cpid_info is the device's own BDF (the VF's BDF for a VF, the
-    PF's BDF for a PF), so each device is a distinct Placement
-    resource provider keyed by its own BDF.
+    The cpid_info is the card's PF BDF in both modes, so each physical
+    card is exactly one device row / one Placement RP.
     """
     driver_cpid = driver_controlpath_id.DriverControlPathID()
     driver_cpid.cpid_type = "PCI"
@@ -319,21 +417,23 @@ def _generate_controlpath_id(gpu):
 
 
 def _generate_driver_device(gpu):
-    """Assemble the DriverDevice for one V620 PF or VF."""
+    """Assemble the DriverDevice for one V620 card.
+
+    Normalization policy (DESIGN §5): anything a machine consumes is a
+    deployable attribute (``rc``, ``trait<n>``, ``numa_node``,
+    ``socket_id``) or a first-class field; ``vendor_board_info`` keeps
+    only genuinely unmodeled vendor data under an ``"other"`` bucket
+    (empty today). The old ``parent_pf`` breadcrumb is gone - the
+    device row *is* the PF, and VF BDFs live in the attach handles.
+    """
     driver_device_obj = driver_device.DriverDevice()
     driver_device_obj.vendor = gpu['vendor_id']
-    driver_device_obj.model = gpu.get('model', 'miss model info')
+    driver_device_obj.model = gpu.get('model_name') or _resolve_model_name(gpu)
     std_board_info = {
         'product_id': gpu.get('product_id'),
         'controller': gpu.get('controller'),
     }
-    vendor_board_info = {
-        'vendor_info': gpu.get('vendor_info', 'gpu_vb_info'),
-    }
-    # Surface the parent PF's BDF on a VF so downstream consumers can
-    # express PF->VF topology. PFs leave this absent.
-    if gpu.get('parent_pf'):
-        vendor_board_info['parent_pf'] = gpu['parent_pf']
+    vendor_board_info = {'other': gpu.get('vendor_other', {})}
     driver_device_obj.std_board_info = jsonutils.dumps(std_board_info)
     driver_device_obj.vendor_board_info = jsonutils.dumps(vendor_board_info)
     driver_device_obj.type = constants.DEVICE_GPU
@@ -353,12 +453,13 @@ def _config_product_ids(opt_name, default):
 
 
 def _discover_v620(vendor_id):
-    """Discover V620 PFs and VFs on the local host.
+    """Discover V620 cards on the local host.
 
-    Returns a list of DriverDevice objects. PF and VF are mutually
-    exclusive at the source: a PF with sriov_numvfs==0 is reported as
-    a single PF DriverDevice; a PF with sriov_numvfs>0 contributes
-    one DriverDevice per VF (the PF is omitted).
+    Returns a list of DriverDevice objects, one per physical card
+    (PF). A PF with sriov_numvfs==0 is a passthrough deployable
+    (num_accelerators=1, handle = PF); a PF with sriov_numvfs>0 is a
+    sliced deployable (num_accelerators = discovered VF count, one
+    handle per VF, sorted by BDF).
     """
     pf_product_ids = set(
         _config_product_ids(
@@ -406,37 +507,96 @@ def _discover_v620(vendor_id):
 
     devices = []
 
-    # 4a. For each known PF, decide PF-mode vs VF-mode by sriov_numvfs.
+    # 4a. One DriverDevice per known PF; sriov_numvfs picks the mode.
     handled_vfs = set()
     for pf_bdf, pf_info in pfs.items():
         numvfs = _read_sriov_numvfs(pf_bdf)
+        pf_info["rc"] = constants.RESOURCES["PGPU"]
+        pf_info["model_name"] = _resolve_model_name(pf_info)
         if numvfs <= 0:
-            # PF-only mode - emit the PF, no VFs.
-            pf_info["rc"] = constants.RESOURCES["PGPU"]
-            pf_info.update(_get_traits_and_numa(pf_bdf, role="PF"))
+            # PF passthrough mode - one handle, the PF itself.
+            pf_info.update(_get_traits_and_numa(
+                pf_bdf, role="PF",
+                product_ids=[pf_info["product_id"].lower()],
+                model_name=pf_info["model_name"],
+            ))
             devices.append(_generate_driver_device(pf_info))
         else:
-            # VF mode - emit one DriverDevice per VF; skip the PF.
-            for vf_bdf in vfs_by_pf.get(pf_bdf, []):
-                vf_info = vfs[vf_bdf]
-                vf_info['parent_pf'] = pf_bdf
-                vf_info["rc"] = constants.RESOURCES["PGPU"]
-                vf_info.update(_get_traits_and_numa(vf_bdf, role="VF"))
-                devices.append(_generate_driver_device(vf_info))
-                handled_vfs.add(vf_bdf)
+            # MxGPU sliced mode - the card is the deployable, the VFs
+            # are its attach handles. Locality (NUMA/socket) is read
+            # from the PF; VFs share it by construction.
+            vf_bdfs = sorted(vfs_by_pf.get(pf_bdf, []))
+            if not vf_bdfs:
+                LOG.warning(
+                    'PF %s reports sriov_numvfs=%d but no enabled VFs '
+                    'were discovered via lspci; skipping the card '
+                    '(no allocatable capacity, and the gim-owned PF '
+                    'must not be offered for passthrough).',
+                    pf_bdf, numvfs,
+                )
+                continue
+            if len(vf_bdfs) != numvfs:
+                LOG.warning(
+                    'PF %s reports sriov_numvfs=%d but %d VFs were '
+                    'discovered; reporting the discovered count.',
+                    pf_bdf, numvfs, len(vf_bdfs),
+                )
+            pf_info["attach_bdfs"] = vf_bdfs
+            vf_products = sorted(
+                {vfs[b]["product_id"].lower() for b in vf_bdfs}
+            )
+            pf_info.update(_get_traits_and_numa(
+                pf_bdf, role="VF",
+                product_ids=(
+                    [pf_info["product_id"].lower()] + vf_products
+                ),
+                model_name=pf_info["model_name"],
+            ))
+            devices.append(_generate_driver_device(pf_info))
+            handled_vfs.update(vf_bdfs)
 
     # 4b. VFs whose parent PF was not seen via lspci (operator filtered
-    #     the PF product ID, or the PF is bound to a different driver
-    #     that hides it). Still emit them.
-    for vf_bdf, vf_info in vfs.items():
+    #     the PF product ID, or the PF is bound to a driver that hides
+    #     it). Group them by sysfs physfn and synthesize a PF-keyed
+    #     card device so the model stays one-RP-per-card; fall back to
+    #     the legacy per-VF shape only when the parent is unreadable.
+    orphans = {}
+    for vf_bdf in vfs:
         if vf_bdf in handled_vfs:
             continue
-        parent = gpu_utils.get_physfn(vf_bdf)
-        if parent:
-            vf_info['parent_pf'] = parent
-        vf_info["rc"] = constants.RESOURCES["PGPU"]
-        vf_info.update(_get_traits_and_numa(vf_bdf, role="VF"))
-        devices.append(_generate_driver_device(vf_info))
+        orphans.setdefault(gpu_utils.get_physfn(vf_bdf), []).append(vf_bdf)
+
+    for parent_bdf, vf_bdfs in orphans.items():
+        vf_bdfs = sorted(vf_bdfs)
+        if parent_bdf:
+            proto = dict(vfs[vf_bdfs[0]])
+            proto["devices"] = parent_bdf
+            proto["attach_bdfs"] = vf_bdfs
+            proto["rc"] = constants.RESOURCES["PGPU"]
+            # PF product unknown (not in lspci): model and product
+            # traits derive from the VF product - a degraded but
+            # honest description of the card.
+            proto["model_name"] = _resolve_model_name(proto)
+            vf_products = sorted(
+                {vfs[b]["product_id"].lower() for b in vf_bdfs}
+            )
+            proto.update(_get_traits_and_numa(
+                parent_bdf, role="VF",
+                product_ids=vf_products,
+                model_name=proto["model_name"],
+            ))
+            devices.append(_generate_driver_device(proto))
+        else:
+            for vf_bdf in vf_bdfs:
+                vf_info = vfs[vf_bdf]
+                vf_info["rc"] = constants.RESOURCES["PGPU"]
+                vf_info["model_name"] = _resolve_model_name(vf_info)
+                vf_info.update(_get_traits_and_numa(
+                    vf_bdf, role="VF",
+                    product_ids=[vf_info["product_id"].lower()],
+                    model_name=vf_info["model_name"],
+                ))
+                devices.append(_generate_driver_device(vf_info))
 
     return devices
 

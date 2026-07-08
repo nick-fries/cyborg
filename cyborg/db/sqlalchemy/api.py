@@ -285,7 +285,13 @@ class Connection(api.Connection):
             deployable_id=deployable_id, in_use=False
         )
         values = {"in_use": True}
-        ref = query.with_for_update().first()
+        # Deterministic allocation: without an ORDER BY, .first() takes
+        # whatever row the backend returns first, so which free handle a
+        # bind gets is arbitrary. Handle rows are created in the order
+        # the driver reports them (drivers sort by BDF), so ordering by
+        # id yields lowest-free-function-first - reproducible boots and
+        # lowest-first reuse of freed functions.
+        ref = query.order_by(models.AttachHandle.id).with_for_update().first()
         if not ref:
             msg = 'Matching deployable_id {}'.format(deployable_id)
             raise exception.ResourceNotFound(resource='AttachHandle', msg=msg)

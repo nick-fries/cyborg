@@ -102,6 +102,38 @@ class TestDbAttachHandle(base.DbTestCase):
         )
         self.assertTrue(allocate_ah['in_use'])
 
+    def test_allocate_is_ordered_by_id(self):
+        """Allocation must be deterministic: lowest free id first.
+
+        Drivers report attach handles sorted by BDF, so row-id order
+        is function order; ORDER BY id makes bind pick the lowest
+        free function every time (and reuse freed ones lowest-first).
+        Regression test for the bare ``.first()`` with no ORDER BY.
+        """
+        for i in (3, 1, 2):
+            utils.create_test_attach_handle(
+                self.context,
+                id=i,
+                uuid=uuidutils.generate_uuid(),
+                deployable_id=7,
+            )
+        first = self.dbapi.attach_handle_allocate(
+            self.context, deployable_id=7
+        )
+        self.assertEqual(1, first['id'])
+        second = self.dbapi.attach_handle_allocate(
+            self.context, deployable_id=7
+        )
+        self.assertEqual(2, second['id'])
+        # Free #1 again: it must be the next one handed out.
+        self.dbapi.attach_handle_update(
+            self.context, first['uuid'], {'in_use': False}
+        )
+        third = self.dbapi.attach_handle_allocate(
+            self.context, deployable_id=7
+        )
+        self.assertEqual(1, third['id'])
+
     def test_delete(self):
         created_ah = utils.create_test_attach_handle(self.context)
         return_value = self.dbapi.attach_handle_delete(
